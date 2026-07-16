@@ -1,14 +1,56 @@
 """
-Diagnóstico 3: Login via API + Playwright com cookie injetado
-Objetivo: capturar o endpoint de consulta real do módulo investigador-osint
+Achaqui Worker — produção
+Estratégia: login via API (AES), cookie injetado no Playwright, consulta via form submit JS
+GitHub Actions 5min cron, loop interno 290s
 """
-import asyncio, os, base64, json, hashlib
+import asyncio, json, os, base64, hashlib, re, time, urllib.request
+from datetime import datetime, timezone
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
-from curl_cffi import requests as cf
+from curl_cffi import requests as cf_req
 from playwright.async_api import async_playwright
 
-# ── Crypto ─────────────────────────────────────────────────────────────────────
+try:
+    from playwright_stealth import Stealth
+    HAS_STEALTH = True
+except ImportError:
+    HAS_STEALTH = False
+
+# ── Config ───────────────────────────────────────────────────────────────────
+FK          = os.environ.get('FIREBASE_API_KEY', 'AIzaSyAoZYnDTl8WoCG5K3q6hjFQnVFmkAS6PZ8')
+FS_BASE     = 'https://firestore.googleapis.com/v1/projects/bancadamatriz-9f797/databases/(default)/documents'
+NTFY        = 'https://ntfy.sh/achaqui-zapia-guga-secret-2025'
+POLL_SEC    = 20
+NTFY_SEC    = 5
+RUN_DURATION = int(os.environ.get('RUN_DURATION', '0'))
+
+BASE        = 'https://detetiveforense.com'
+DF_USER     = 'edson102'
+DF_PASS     = '123456789'
+DF_PIN      = '162738'
+DEVTOOL_CHUNK = '0888c0b2fc92ae80.js'
+FAKE_JS     = '(globalThis.TURBOPACK||(globalThis.TURBOPACK=[])).push([null,98226,(e,t,n)=>{t.exports=()=>{}}])'
+
+# Mapa productId -> módulo
+MODULE_MAP = {
+    'cpf-basico': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
+    'cpf-completo': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
+    'cpf-pro': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
+    'nome-cpf': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
+    'parentes': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
+    'historico-enderecos': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
+    'telefones': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
+    'foto-redes': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
+    'cnh-consulta': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
+    'historico-criminal': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
+    'processos-cpf': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
+    'score-credito': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
+    'placa-basico': {'url': '/app/modulos/mega-placa', 'field': 'placa', 'tab': 'placa'},
+    'placa-historico': {'url': '/app/modulos/mega-placa-2', 'field': 'placa', 'tab': 'placa'},
+    'cnpj-basico': {'url': '/app/modulos/investigador-osint', 'field': 'cnpj', 'tab': 'documentos'},
+}
+
+# ── Crypto ───────────────────────────────────────────────────────────────────
 i_map = {"utc":[77,114,88,110],"est":[55,76,98,72],"cst":[107,51,87,113],"mst":[82,104,74,53],"pst":[100,65,111,89],"gmt":[70,115,54,106],"cet":[113,78,103,52],"eet":[88,109,66,120],"ist":[57,85,116,75],"jst":[108,71,56,99],"kst":[80,105,90,55],"nst":[101,68,110,83],"hst":[66,119,77,97],"akt":[118,48,102,79],"wst":[106,81,72,114],"aet":[51,107,89,69]}
 KEY_O = ''.join(chr(v) for vals in i_map.values() for v in vals)
 
@@ -27,7 +69,7 @@ def enc_raw(pt, kh, ivh):
 
 def encrypt_req(pt):
     k, iv = os.urandom(32), os.urandom(16)
-    return base64.b64encode(json.dumps({"dracula": {"encryptedAesKey": enc_str(k.hex(), KEY_O), "encryptedText": enc_raw(pt, k.hex(), iv.hex()), "iv": iv.hex()}}).encode()).decode()
+    return base64.b64encode(json.dumps({"dracula":{"encryptedAesKey":enc_str(k.hex(),KEY_O),"encryptedText":enc_raw(pt,k.hex(),iv.hex()),"iv":iv.hex()}}).encode()).decode()
 
 def dec_str(ct, ks):
     raw = base64.b64decode(ct); k, iv = evp(ks.encode(), raw[8:16])
@@ -40,133 +82,294 @@ def decrypt_resp(ct):
             d = raw['dracula']; kh = dec_str(d['encryptedAesKey'], KEY_O)
             k, iv = bytes.fromhex(kh), bytes.fromhex(d['iv'])
             return json.loads(unpad(AES.new(k, AES.MODE_CBC, iv).decrypt(base64.b64decode(d['encryptedText'])), 16).decode())
-    except:
-        return {}
+    except: return None
 
-BASE = "https://detetiveforense.com"
-RUN_DURATION = int(os.environ.get("RUN_DURATION", "0"))
+# ── Firestore helpers ─────────────────────────────────────────────────────────
+def fs_req(path, method='GET', body=None):
+    url = f'{FS_BASE}/{path}?key={FK}'
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'}, method=method)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
 
-async def main():
-    # Step 1: Login via API (sem browser)
-    cf_s = cf.Session(impersonate="chrome124")
-    cf_s.get(f"{BASE}/auth/login", timeout=20)
+def fs_query():
+    url = f'{FS_BASE}:runQuery?key={FK}'
+    body = {"structuredQuery": {
+        "from": [{"collectionId": "orders"}],
+        "where": {"fieldFilter": {"field": {"fieldPath": "status"}, "op": "EQUAL", "value": {"stringValue": "processing"}}},
+        "limit": 5
+    }}
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'}, method='POST')
+    with urllib.request.urlopen(req, timeout=10) as r:
+        docs = json.loads(r.read())
+    orders = []
+    for d in docs:
+        if 'document' not in d: continue
+        f = d['document']['fields']
+        oid = d['document']['name'].split('/')[-1]
+        g = lambda k: (f.get(k) or {}).get('stringValue') or ''
+        orders.append({'id': oid, 'productId': g('productId'), 'productName': g('productName'), 'queryData': g('queryData')})
+    return orders
+
+def fs_save(oid, result):
+    now = datetime.now(timezone.utc).isoformat()
+    fields = ['status', 'result', 'deliveredAt']
+    mask = '&'.join(f'updateMask.fieldPaths={f}' for f in fields)
+    url = f'{FS_BASE}/orders/{oid}?key={FK}&{mask}'
+    body = {"fields": {"status": {"stringValue": "done"}, "result": {"stringValue": result}, "deliveredAt": {"stringValue": now}}}
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'}, method='PATCH')
+    with urllib.request.urlopen(req, timeout=10) as r: r.read()
+
+def fs_error(oid, msg):
+    fields = ['status', 'result']
+    mask = '&'.join(f'updateMask.fieldPaths={f}' for f in fields)
+    url = f'{FS_BASE}/orders/{oid}?key={FK}&{mask}'
+    body = {"fields": {"status": {"stringValue": "error"}, "result": {"stringValue": f"⚠️ Erro: {msg[:200]}\n\nContato: +55 68 98101-4570"}}}
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'}, method='PATCH')
+    with urllib.request.urlopen(req, timeout=10) as r: r.read()
+
+def ntfy_poll():
+    try:
+        url = f'{NTFY}/json?poll=1&since=2m'
+        req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            raw = r.read().decode()
+        ids = []
+        for line in raw.strip().split('\n'):
+            if not line: continue
+            try:
+                msg = json.loads(line)
+                if msg.get('event') == 'message': ids.append(msg.get('message','').strip())
+            except: pass
+        return ids
+    except: return []
+
+# ── Login via API ─────────────────────────────────────────────────────────────
+def api_login():
+    s = cf_req.Session(impersonate="chrome124")
+    s.get(f"{BASE}/auth/login", timeout=20)
     H = {"Content-Type": "text/plain", "Referer": f"{BASE}/auth/login", "Origin": BASE}
-    decrypt_resp(cf_s.post(f"{BASE}/api/auth/login",
-        data=encrypt_req(json.dumps({"username": "edson102", "password": "123456789", "visitorId": None})),
+    decrypt_resp(s.post(f"{BASE}/api/auth/login",
+        data=encrypt_req(json.dumps({"username": DF_USER, "password": DF_PASS, "visitorId": None})),
         headers=H, timeout=15).text)
-    r_pin = decrypt_resp(cf_s.post(f"{BASE}/api/auth/login-pin",
-        data=encrypt_req(json.dumps({"username": "edson102", "password": "123456789", "pin": "162738", "visitorId": None})),
+    r2 = decrypt_resp(s.post(f"{BASE}/api/auth/login-pin",
+        data=encrypt_req(json.dumps({"username": DF_USER, "password": DF_PASS, "pin": DF_PIN, "visitorId": None})),
         headers=H, timeout=15).text)
-    
-    print(f"[API Login] success={r_pin.get('success')}")
-    access_token = dict(cf_s.cookies).get("accessToken", "")
-    print(f"[API Login] accessToken: {access_token[:30]}...")
+    if r2 and r2.get('success'):
+        token = dict(s.cookies).get('accessToken', '')
+        print(f'[Login] API OK, token: {token[:20]}...')
+        return token
+    print('[Login] API falhou')
+    return None
 
-    # Step 2: Playwright com cookie injetado
-    DEVTOOL_CHUNK = "0888c0b2fc92ae80.js"
-    FAKE_JS = '(globalThis.TURBOPACK||(globalThis.TURBOPACK=[])).push([null,98226,(e,t,n)=>{t.exports=()=>{}}])'
+# ── Playwright consulta ───────────────────────────────────────────────────────
+async def consultar(page, module_info, query_data):
+    url = f"{BASE}{module_info['url']}"
+    field = module_info['field']
 
-    captured = []
+    # Navega para o módulo
+    await page.goto(url, wait_until='domcontentloaded', timeout=20000)
+    await page.wait_for_timeout(3000)
+    print(f'[Consulta] URL: {page.url}')
+
+    # Usa JS para preencher e submeter o formulário React
+    # React Hook Form mantém estado interno — usamos nativeInputValueSetter
+    result = await page.evaluate(f"""
+        async () => {{
+            // Aguarda o React montar completamente
+            await new Promise(r => setTimeout(r, 2000));
+
+            // Preenche o campo via React nativeInputValueSetter
+            const inputs = document.querySelectorAll('input');
+            let targetInput = null;
+            for (const inp of inputs) {{
+                if (inp.name === '{field}' || inp.placeholder && inp.placeholder.toLowerCase().includes('{field}')) {{
+                    targetInput = inp;
+                    break;
+                }}
+            }}
+            // Fallback: primeiro input de texto visível
+            if (!targetInput) {{
+                for (const inp of inputs) {{
+                    if (inp.type === 'text' && !inp.hidden && inp.offsetParent !== null) {{
+                        targetInput = inp;
+                        break;
+                    }}
+                }}
+            }}
+            if (!targetInput) return {{ error: 'Input não encontrado', inputs: inputs.length }};
+
+            // Usa nativeInputValueSetter para acionar eventos React
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            nativeInputValueSetter.call(targetInput, '{query_data}');
+            targetInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            targetInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+
+            await new Promise(r => setTimeout(r, 500));
+
+            // Submete o formulário
+            const form = targetInput.closest('form');
+            if (form) {{
+                form.requestSubmit();
+                return {{ status: 'submitted', field: targetInput.name || targetInput.placeholder }};
+            }} else {{
+                // Tenta Enter
+                targetInput.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', keyCode: 13, bubbles: true }}));
+                targetInput.dispatchEvent(new KeyboardEvent('keyup', {{ key: 'Enter', keyCode: 13, bubbles: true }}));
+                return {{ status: 'enter_pressed', field: targetInput.name || targetInput.placeholder }};
+            }}
+        }}
+    """)
+    print(f'[Consulta] Form submit: {result}')
+
+    # Aguarda resultado aparecer na página (10s)
+    await page.wait_for_timeout(10000)
+
+    # Captura o conteúdo resultante
+    try:
+        # Procura por cards de resultado
+        content = await page.evaluate("""
+            () => {
+                // Pega todo texto dos cards de resultado
+                const selectors = [
+                    '[class*="result"]', '[class*="card"]', 'main article',
+                    '[class*="consulta"]', '[class*="dados"]', 'main'
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.innerText && el.innerText.length > 100) {
+                        return el.innerText;
+                    }
+                }
+                return document.body.innerText;
+            }
+        """)
+        return content
+    except Exception as e:
+        return await page.inner_text('body')
+
+def formatar(raw, product_name, query_data):
+    now = datetime.now().strftime('%d/%m/%Y às %H:%M')
+    skip = ['Copiar', 'Exportar', 'Fechar', 'Buscar Mandados', 'Validar Foto',
+            'Galeria', '100% gratuito', 'caráter histórico', 'PRINCIPAL', 'Módulos']
+    linhas = [l.strip() for l in raw.split('\n') if l.strip() and not any(s in l for s in skip)]
+    out  = f'🔍 RELATÓRIO — ACHAQUI\n'
+    out += f'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
+    out += f'📋 {product_name}\n'
+    out += f'🔎 Consulta: {query_data}\n'
+    out += f'📅 {now}\n'
+    out += f'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
+    out += '\n'.join(linhas[:100])
+    return out
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+async def main():
+    print('[Achaqui Worker] Iniciando...')
+    start = time.time()
+    processed = set()
+
+    # Login via API
+    access_token = api_login()
+    if not access_token:
+        print('[Worker] Sem token, abortando')
+        return
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
+            args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled']
         )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}
+            user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36',
+            viewport={'width': 1280, 'height': 800},
+            locale='pt-BR', timezone_id='America/Sao_Paulo'
         )
 
-        # Injeta cookie de autenticação
-        if access_token:
-            await context.add_cookies([{
-                "name": "accessToken",
-                "value": access_token,
-                "domain": "detetiveforense.com",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True
-            }])
-            print("[Cookie] accessToken injetado!")
+        if HAS_STEALTH:
+            await Stealth().apply_stealth_async(context)
+
+        # Injeta o accessToken
+        await context.add_cookies([{
+            'name': 'accessToken', 'value': access_token,
+            'domain': 'detetiveforense.com', 'path': '/', 'httpOnly': True, 'secure': True
+        }])
 
         page = await context.new_page()
 
-        # Bloqueia DevtoolDisabler
+        # Bloqueia o DevtoolDisabler
         async def handle_route(route):
             if DEVTOOL_CHUNK in route.request.url:
-                print(f"[Bypass] Bloqueado: {route.request.url[-40:]}")
-                await route.fulfill(status=200, content_type="application/javascript", body=FAKE_JS)
+                print(f'[Bypass] Bloqueado DevtoolDisabler')
+                await route.fulfill(status=200, content_type='application/javascript', body=FAKE_JS)
             else:
                 await route.continue_()
 
-        await page.route("**/*", handle_route)
+        await page.route('**/*', handle_route)
 
-        # Captura requests de consulta
-        def on_request(req):
-            url = req.url
-            if "detetiveforense.com/api/" in url:
-                skip = ["auth", "notification", "users/me", "users/balance", "last-not"]
-                if not any(s in url for s in skip):
-                    captured.append({"url": url, "method": req.method})
-                    print(f"[API Req] {req.method} {url}")
+        print('[Worker] Browser OK, entrando no loop...')
 
-        async def on_response(resp):
-            url = resp.url
-            if "detetiveforense.com/api/" in url:
-                skip = ["auth", "notification", "users/me", "users/balance", "last-not"]
-                if not any(s in url for s in skip):
-                    try:
-                        body = await resp.body()
-                        print(f"[API Resp] {resp.status} {url} | body({len(body)}): {body[:100]}")
-                    except:
-                        pass
+        last_fs = 0
+        last_ntfy = 0
 
-        page.on("request", on_request)
-        page.on("response", lambda r: asyncio.ensure_future(on_response(r)))
+        while True:
+            now = time.time()
+            if RUN_DURATION > 0 and (now - start) >= RUN_DURATION:
+                print(f'[Worker] {RUN_DURATION}s atingido. Encerrando.')
+                break
 
-        # Navega para o módulo (deve estar logado pelo cookie)
-        print("[Nav] Indo para módulo investigador-osint...")
-        r = await page.goto(f"{BASE}/app/modulos/investigador-osint", wait_until="domcontentloaded", timeout=25000)
-        print(f"[Nav] status={r.status if r else 'None'}, url={page.url}")
-        await page.wait_for_timeout(3000)
+            orders = []
 
-        # Verifica se está logado
-        body_text = ""
-        try:
-            body_text = await page.inner_text("body")
-            print(f"[Page] Body (300c): {body_text[:300]}")
-        except:
-            pass
+            if now - last_fs >= POLL_SEC:
+                last_fs = now
+                try:
+                    orders += fs_query()
+                except Exception as e:
+                    print(f'[Worker] Firestore erro: {e}')
 
-        # Procura input e preenche CPF de teste
-        try:
-            inputs = await page.query_selector_all("input")
-            print(f"[Form] {len(inputs)} inputs encontrados")
-            for inp in inputs:
-                ph = await inp.get_attribute("placeholder") or ""
-                tp = await inp.get_attribute("type") or ""
-                print(f"  input: placeholder='{ph}', type='{tp}'")
+            if now - last_ntfy >= NTFY_SEC:
+                last_ntfy = now
+                try:
+                    for oid in ntfy_poll():
+                        if oid and oid not in processed:
+                            try:
+                                doc = fs_req(f'orders/{oid}')
+                                f = doc.get('fields', {})
+                                g = lambda k: (f.get(k) or {}).get('stringValue') or ''
+                                if g('status') == 'processing':
+                                    orders.append({'id': oid, 'productId': g('productId'), 'productName': g('productName'), 'queryData': g('queryData')})
+                            except: pass
+                except: pass
 
-            if inputs:
-                await inputs[0].fill("077.349.584-00")
-                await page.wait_for_timeout(800)
-                await page.keyboard.press("Enter")
-                print("[Form] CPF preenchido e Enter pressionado!")
-                await page.wait_for_timeout(8000)
-                print(f"[Nav] URL após submit: {page.url}")
-        except Exception as e:
-            print(f"[Form] Erro: {e}")
+            for order in orders:
+                oid = order['id']
+                if oid in processed: continue
+                processed.add(oid)
 
-        print(f"\n[Result] Requests capturadas: {json.dumps(captured, indent=2)}")
+                try:
+                    doc = fs_req(f'orders/{oid}')
+                    g = lambda k: (doc.get('fields', {}).get(k) or {}).get('stringValue') or ''
+                    if g('status') == 'done': continue
+                except: continue
+
+                print(f'[Worker] Processando {oid}: {order["productId"]} / {order["queryData"]}')
+
+                module_info = MODULE_MAP.get(order['productId'])
+                if not module_info:
+                    # Fallback: investigador-osint com o dado como CPF
+                    module_info = {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'}
+
+                try:
+                    raw = await consultar(page, module_info, order['queryData'])
+                    resultado = formatar(raw, order.get('productName', order['productId']), order['queryData'])
+                    fs_save(oid, resultado)
+                    print(f'[Worker] ✅ {oid} ({len(resultado)} chars)')
+                except Exception as e:
+                    print(f'[Worker] ❌ {oid}: {e}')
+                    try: fs_error(oid, str(e))
+                    except: pass
+
+            await asyncio.sleep(NTFY_SEC)
+
         await browser.close()
-
-    if RUN_DURATION > 0:
-        import time
-        elapsed = 120
-        remaining = RUN_DURATION - elapsed
-        if remaining > 0:
-            print(f"[Worker] Aguardando {remaining}s...")
-            time.sleep(remaining)
 
 asyncio.run(main())
