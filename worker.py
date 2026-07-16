@@ -167,7 +167,7 @@ async def login_detetive(page):
     await page.wait_for_timeout(1500)
 
     # Aguarda campo Usuário (placeholder exato: "Digite seu usuário")
-    await page.wait_for_selector('input[placeholder="Digite seu usuário"]', timeout=15000)
+    await page.wait_for_selector('input[placeholder="Digite seu usuário"]', timeout=25000)
 
     await page.fill('input[placeholder="Digite seu usuário"]', 'edson102')
     await page.wait_for_timeout(300)
@@ -214,8 +214,23 @@ async def main():
     processed = set()  # evita reprocessar
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage'])
-        context = await browser.new_context(viewport={'width':1280,'height':800})
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-infobars',
+                '--window-size=1280,800',
+            ]
+        )
+        context = await browser.new_context(
+            user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+            viewport={'width': 1280, 'height': 800},
+            locale='pt-BR',
+            timezone_id='America/Sao_Paulo',
+        )
+        # context já criado acima com stealth settings
         page    = await context.new_page()
 
         # Login inicial
