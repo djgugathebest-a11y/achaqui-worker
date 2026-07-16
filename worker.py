@@ -223,11 +223,11 @@ async def consultar(page, module_info, query_data):
     print(f'[Consulta] Form submit: {result}')
 
     # Aguarda resultado aparecer na página (10s)
-    await page.wait_for_timeout(10000)
+    # Aguarda resultado (15s para o React processar a Server Action)
+    await page.wait_for_timeout(15000)
 
     # Captura o conteúdo resultante
     try:
-        # Procura por cards de resultado
         content = await page.evaluate("""
             () => {
                 // Pega todo texto dos cards de resultado
@@ -244,9 +244,12 @@ async def consultar(page, module_info, query_data):
                 return document.body.innerText;
             }
         """)
+        print(f'[Consulta] Resultado ({len(content)} chars): {content[:500]}')
         return content
     except Exception as e:
-        return await page.inner_text('body')
+        body = await page.inner_text('body')
+        print(f'[Consulta] Fallback ({len(body)} chars): {body[:500]}')
+        return body
 
 def formatar(raw, product_name, query_data):
     now = datetime.now().strftime('%d/%m/%Y às %H:%M')
