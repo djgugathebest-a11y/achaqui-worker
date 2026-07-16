@@ -1,469 +1,172 @@
 """
-Achaqui Worker — processa pedidos do Firestore via Playwright
-GitHub Actions 5min cron, loop interno de 290s
+Diagnóstico 3: Login via API + Playwright com cookie injetado
+Objetivo: capturar o endpoint de consulta real do módulo investigador-osint
 """
-
-import asyncio
-import json
-import os
-import re
-import time
-import urllib.request
-from datetime import datetime, timezone
+import asyncio, os, base64, json, hashlib
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+from curl_cffi import requests as cf
 from playwright.async_api import async_playwright
 
-try:
-    from playwright_stealth import Stealth
-    HAS_STEALTH = True
-except ImportError:
-    HAS_STEALTH = False
+# ── Crypto ─────────────────────────────────────────────────────────────────────
+i_map = {"utc":[77,114,88,110],"est":[55,76,98,72],"cst":[107,51,87,113],"mst":[82,104,74,53],"pst":[100,65,111,89],"gmt":[70,115,54,106],"cet":[113,78,103,52],"eet":[88,109,66,120],"ist":[57,85,116,75],"jst":[108,71,56,99],"kst":[80,105,90,55],"nst":[101,68,110,83],"hst":[66,119,77,97],"akt":[118,48,102,79],"wst":[106,81,72,114],"aet":[51,107,89,69]}
+KEY_O = ''.join(chr(v) for vals in i_map.values() for v in vals)
 
-# ── Config ───────────────────────────────────────────────────────────────────
-FK           = os.environ.get('FIREBASE_API_KEY', 'AIzaSyAoZYnDTl8WoCG5K3q6hjFQnVFmkAS6PZ8')
-FS_BASE      = 'https://firestore.googleapis.com/v1/projects/bancadamatriz-9f797/databases/(default)/documents'
-NTFY_URL     = 'https://ntfy.sh/achaqui-zapia-guga-secret-2025'
-POLL_SEC     = 20
-NTFY_SEC     = 5
-RUN_DURATION = int(os.environ.get('RUN_DURATION', '0'))
+def evp(pw, salt):
+    d, di = b'', b''
+    while len(d) < 48:
+        di = hashlib.md5(di + pw + salt).digest(); d += di
+    return d[:32], d[32:48]
 
-DF_BASE      = 'https://detetiveforense.com'
-DF_LOGIN_URL = f'{DF_BASE}/auth/login'
-DF_USER      = 'edson102'
-DF_PASS      = '123456789'
-DF_PIN       = '162738'
+def enc_str(pt, ks):
+    salt = os.urandom(8); k, iv = evp(ks.encode(), salt)
+    return base64.b64encode(b"Salted__" + salt + AES.new(k, AES.MODE_CBC, iv).encrypt(pad(pt.encode(), 16))).decode()
 
-# Chunk da lib disable-devtool — retornar vazio impede o redirect anti-bot
-DISABLE_DEVTOOL_CHUNK = '0888c0b2fc92ae80.js'
-# Override: módulo Turbopack válido mas que exporta função vazia
-DEVTOOL_OVERRIDE_JS = (
-    '(globalThis.TURBOPACK||(globalThis.TURBOPACK=[])).push(['
-    '"object"==typeof document?document.currentScript:void 0,'
-    '98226,(e,t,n)=>{t.exports=function(){return null}}]);'
-)
+def enc_raw(pt, kh, ivh):
+    return base64.b64encode(AES.new(bytes.fromhex(kh), AES.MODE_CBC, bytes.fromhex(ivh)).encrypt(pad(pt.encode(), 16))).decode()
 
-# ── Firestore helpers ─────────────────────────────────────────────────────────
-def fs_get(path):
-    url = f'{FS_BASE}/{path}?key={FK}'
-    req = urllib.request.Request(url, headers={'Content-Type': 'application/json'})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())
+def encrypt_req(pt):
+    k, iv = os.urandom(32), os.urandom(16)
+    return base64.b64encode(json.dumps({"dracula": {"encryptedAesKey": enc_str(k.hex(), KEY_O), "encryptedText": enc_raw(pt, k.hex(), iv.hex()), "iv": iv.hex()}}).encode()).decode()
 
-def fs_patch(path, fields, field_names):
-    mask = '&'.join(f'updateMask.fieldPaths={f}' for f in field_names)
-    url  = f'{FS_BASE}/{path}?key={FK}&{mask}'
-    body = json.dumps({'fields': fields}).encode()
-    req  = urllib.request.Request(url, data=body,
-           headers={'Content-Type': 'application/json'}, method='PATCH')
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())
+def dec_str(ct, ks):
+    raw = base64.b64decode(ct); k, iv = evp(ks.encode(), raw[8:16])
+    return unpad(AES.new(k, AES.MODE_CBC, iv).decrypt(raw[16:]), 16).decode()
 
-def fs_query_processing():
-    url  = f'{FS_BASE}:runQuery?key={FK}'
-    body = json.dumps({'structuredQuery': {
-        'from': [{'collectionId': 'orders'}],
-        'where': {'fieldFilter': {
-            'field': {'fieldPath': 'status'},
-            'op': 'EQUAL',
-            'value': {'stringValue': 'processing'}
-        }},
-        'limit': 5
-    }}).encode()
-    req = urllib.request.Request(url, data=body,
-          headers={'Content-Type': 'application/json'}, method='POST')
-    with urllib.request.urlopen(req, timeout=10) as r:
-        docs = json.loads(r.read())
-    orders = []
-    for d in docs:
-        if 'document' not in d:
-            continue
-        f   = d['document']['fields']
-        oid = d['document']['name'].split('/')[-1]
-        g   = lambda k: (f.get(k) or {}).get('stringValue') or ''
-        orders.append({
-            'id':          oid,
-            'productId':   g('productId'),
-            'productName': g('productName'),
-            'queryData':   g('queryData'),
-        })
-    return orders
-
-def fs_save(order_id, result_text):
-    now = datetime.now(timezone.utc).isoformat()
-    fs_patch(f'orders/{order_id}',
-        {'status': {'stringValue': 'done'},
-         'result': {'stringValue': result_text},
-         'deliveredAt': {'stringValue': now}},
-        ['status', 'result', 'deliveredAt'])
-
-def fs_error(order_id, msg):
-    fs_patch(f'orders/{order_id}',
-        {'status': {'stringValue': 'error'},
-         'result': {'stringValue': f'⚠️ Erro: {msg[:200]}\nSuporte: +55 68 98101-4570'}},
-        ['status', 'result'])
-
-def ntfy_poll():
+def decrypt_resp(ct):
     try:
-        url = f'{NTFY_URL}/json?poll=1&since=2m'
-        req = urllib.request.Request(url, headers={'Accept': 'application/json'})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            raw = r.read().decode()
-        ids = []
-        for line in raw.strip().split('\n'):
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-                if msg.get('event') == 'message':
-                    ids.append(msg.get('message', '').strip())
-            except:
-                pass
-        return ids
+        raw = json.loads(base64.b64decode(ct))
+        if 'dracula' in raw:
+            d = raw['dracula']; kh = dec_str(d['encryptedAesKey'], KEY_O)
+            k, iv = bytes.fromhex(kh), bytes.fromhex(d['iv'])
+            return json.loads(unpad(AES.new(k, AES.MODE_CBC, iv).decrypt(base64.b64decode(d['encryptedText'])), 16).decode())
     except:
-        return []
+        return {}
 
-# ── Diagnóstico de rede ───────────────────────────────────────────────────────
-def diag_network():
-    try:
-        req = urllib.request.Request(DF_LOGIN_URL,
-              headers={'User-Agent': 'Mozilla/5.0 Chrome/125'})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            size = len(r.read())
-        print(f'[Diag] HTTP OK: {r.status}, {size}b')
-    except Exception as e:
-        print(f'[Diag] HTTP ERRO: {e}')
+BASE = "https://detetiveforense.com"
+RUN_DURATION = int(os.environ.get("RUN_DURATION", "0"))
 
-# ── Login via Playwright ──────────────────────────────────────────────────────
-async def setup_context(pw):
-    """Cria contexto com stealth + bloqueio do DevtoolDisabler."""
-    browser = await pw.chromium.launch(
-        headless=True,
-        args=[
-            '--no-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-blink-features=AutomationControlled',
-            '--disable-features=IsolateOrigins,site-per-process',
-        ]
-    )
-    context = await browser.new_context(
-        user_agent=(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/125.0.0.0 Safari/537.36'
-        ),
-        viewport={'width': 1280, 'height': 800},
-        locale='pt-BR',
-        timezone_id='America/Sao_Paulo',
-    )
-
-    if HAS_STEALTH:
-        await Stealth().apply_stealth_async(context)
-        print('[Setup] Stealth aplicado')
-
-    # BLOQUEIA o chunk do DevtoolDisabler — retorna módulo vazio
-    async def block_devtool(route):
-        if DISABLE_DEVTOOL_CHUNK in route.request.url:
-            print(f'[Bypass] Bloqueando DevtoolDisabler: {route.request.url}')
-            await route.fulfill(
-                status=200,
-                content_type='application/javascript',
-                body=DEVTOOL_OVERRIDE_JS
-            )
-        else:
-            await route.continue_()
-
-    await context.route('**/*.js', block_devtool)
-
-    # Script injetado antes de qualquer JS: protege window.location
-    await context.add_init_script("""
-        (function() {
-            // Sobrescreve location.href setter para bloquear redirects externos
-            const allowedHosts = ['detetiveforense.com'];
-            const _href_desc = Object.getOwnPropertyDescriptor(window.Location.prototype, 'href');
-            
-            Object.defineProperty(window.Location.prototype, 'href', {
-                get: function() { return _href_desc.get.call(this); },
-                set: function(val) {
-                    try {
-                        const host = new URL(val, window.location.href).hostname;
-                        if (!allowedHosts.some(h => host.endsWith(h))) {
-                            console.warn('[Achaqui] Redirect bloqueado para: ' + val);
-                            return;
-                        }
-                    } catch(e) {}
-                    _href_desc.set.call(this, val);
-                },
-                configurable: true
-            });
-
-            // Bloqueia window.location.replace e assign
-            const origReplace = window.Location.prototype.replace;
-            window.Location.prototype.replace = function(url) {
-                try {
-                    const host = new URL(url, window.location.href).hostname;
-                    if (!['detetiveforense.com'].some(h => host.endsWith(h))) {
-                        console.warn('[Achaqui] replace bloqueado: ' + url);
-                        return;
-                    }
-                } catch(e) {}
-                return origReplace.call(this, url);
-            };
-
-            const origAssign = window.Location.prototype.assign;
-            window.Location.prototype.assign = function(url) {
-                try {
-                    const host = new URL(url, window.location.href).hostname;
-                    if (!['detetiveforense.com'].some(h => host.endsWith(h))) {
-                        console.warn('[Achaqui] assign bloqueado: ' + url);
-                        return;
-                    }
-                } catch(e) {}
-                return origAssign.call(this, url);
-            };
-
-            // Bloqueia window.history.back() que o disable-devtool usa
-            const origBack = window.history.back.bind(window.history);
-            window.history.back = function() {
-                console.warn('[Achaqui] history.back() bloqueado');
-            };
-        })();
-    """)
-
-    return browser, context
-
-async def login_detetive(page):
-    print('[Login] Navegando...')
-    try:
-        resp = await page.goto(DF_LOGIN_URL, wait_until='domcontentloaded', timeout=25000)
-        print(f'[Login] goto: status={resp.status if resp else "?"}, URL={page.url}')
-    except Exception as e:
-        print(f'[Login] goto erro: {e}')
-
-    # Aguarda o React montar (sem esperar muito — o DevtoolDisabler seria carregado depois)
-    await page.wait_for_timeout(3000)
-
-    url = page.url
-    print(f'[Login] URL após 3s: {url}')
-
-    if url == 'about:blank' or 'detetiveforense' not in url:
-        print('[Login] AINDA em about:blank — tentando novamente com espera maior')
-        try:
-            resp = await page.goto(DF_LOGIN_URL, wait_until='domcontentloaded', timeout=25000)
-            await page.wait_for_timeout(4000)
-            url = page.url
-            print(f'[Login] 2a tentativa URL: {url}')
-        except Exception as e:
-            print(f'[Login] 2a tentativa erro: {e}')
-
-    if 'detetiveforense' not in page.url:
-        print('[Login] FALHA: não conseguiu navegar para o site')
-        return False
-
-    # Se já está logado
-    if '/app/' in page.url:
-        print('[Login] Já autenticado!')
-        return True
-
-    # Preenche formulário
-    try:
-        await page.wait_for_selector('input[placeholder="Digite seu usuário"]', timeout=12000)
-        print('[Login] Formulário encontrado!')
-        await page.fill('input[placeholder="Digite seu usuário"]', DF_USER)
-        await page.wait_for_timeout(400)
-        await page.fill('input[placeholder="Digite sua senha"]', DF_PASS)
-        await page.wait_for_timeout(400)
-        await page.click('button:has-text("Entrar")')
-        await page.wait_for_timeout(5000)
-        print(f'[Login] Após submit: {page.url}')
-
-        # Log do body para debug
-        try:
-            body_after = await page.inner_text('body')
-            print(f'[Login] Body pós-submit (300c): {body_after[:300]}')
-        except:
-            pass
-
-        # PIN se necessário
-        try:
-            pin = await page.query_selector('input[maxlength="6"], input[placeholder*="PIN"], input[placeholder*="pin"]')
-            if pin:
-                print('[Login] PIN solicitado...')
-                await pin.fill(DF_PIN)
-                await page.keyboard.press('Enter')
-                await page.wait_for_timeout(4000)
-                print(f'[Login] Após PIN: {page.url}')
-                try:
-                    body_pin = await page.inner_text('body')
-                    print(f'[Login] Body pós-PIN (300c): {body_pin[:300]}')
-                except:
-                    pass
-        except:
-            pass
-
-        # Aguarda redirect para /app/ com até 10s
-        try:
-            await page.wait_for_url('**/app/**', timeout=10000)
-            print(f'[Login] Redirect para /app/ detectado: {page.url}')
-        except:
-            print(f'[Login] Sem redirect para /app/ após 10s. URL: {page.url}')
-
-        return '/app/' in page.url
-
-    except Exception as e:
-        print(f'[Login] Formulário não encontrado: {e}')
-        try:
-            body = await page.inner_text('body')
-            print(f'[Login] Conteúdo: {body[:300]}')
-        except:
-            pass
-        return False
-
-# ── Consulta ──────────────────────────────────────────────────────────────────
-async def consultar(page, modulo, query_data):
-    url = f'{DF_BASE}/app/modulos/{modulo}'
-    await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-    await page.wait_for_timeout(2000)
-    print(f'[Consulta] URL: {page.url}')
-
-    # Campo de busca
-    try:
-        await page.wait_for_selector('input[placeholder], input[type="text"]', timeout=12000)
-        inputs = await page.query_selector_all('input[placeholder], input[type="text"]')
-        if inputs:
-            await inputs[0].fill(query_data)
-            await page.wait_for_timeout(400)
-            btn = await page.query_selector('button[type="submit"], button:has-text("Buscar"), button:has-text("Consultar"), button:has-text("Pesquisar")')
-            if btn:
-                await btn.click()
-            else:
-                await inputs[0].press('Enter')
-    except Exception as e:
-        print(f'[Consulta] Erro campo busca: {e}')
-
-    await page.wait_for_timeout(6000)
-
-    # Coleta resultado
-    try:
-        result = await page.inner_text('main')
-    except:
-        try:
-            result = await page.inner_text('body')
-        except:
-            result = ''
-
-    return result
-
-def formatar(raw, product_name, query_data):
-    now = datetime.now().strftime('%d/%m/%Y às %H:%M')
-    skip = ['Copiar Dados', 'Exportar PDF', 'Adicionar em', 'Fechar', 'Buscar Mandados',
-            'Validar Foto', 'Galeria de Fotos', '100% gratuito', 'caráter histórico']
-    linhas = [l.strip() for l in raw.split('\n')
-              if l.strip() and not any(s in l for s in skip)]
-    out  = f'🔍 RELATÓRIO — ACHAQUI\n'
-    out += f'━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
-    out += f'📋 Produto: {product_name}\n'
-    out += f'🔎 Consulta: {query_data}\n'
-    out += f'📅 Data: {now}\n'
-    out += f'━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
-    out += '\n'.join(linhas[:80])
-    return out
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
-    print('[Achaqui Worker] Iniciando...')
-    diag_network()
+    # Step 1: Login via API (sem browser)
+    cf_s = cf.Session(impersonate="chrome124")
+    cf_s.get(f"{BASE}/auth/login", timeout=20)
+    H = {"Content-Type": "text/plain", "Referer": f"{BASE}/auth/login", "Origin": BASE}
+    decrypt_resp(cf_s.post(f"{BASE}/api/auth/login",
+        data=encrypt_req(json.dumps({"username": "edson102", "password": "123456789", "visitorId": None})),
+        headers=H, timeout=15).text)
+    r_pin = decrypt_resp(cf_s.post(f"{BASE}/api/auth/login-pin",
+        data=encrypt_req(json.dumps({"username": "edson102", "password": "123456789", "pin": "162738", "visitorId": None})),
+        headers=H, timeout=15).text)
+    
+    print(f"[API Login] success={r_pin.get('success')}")
+    access_token = dict(cf_s.cookies).get("accessToken", "")
+    print(f"[API Login] accessToken: {access_token[:30]}...")
 
-    processed = set()
-    start = time.time()
+    # Step 2: Playwright com cookie injetado
+    DEVTOOL_CHUNK = "0888c0b2fc92ae80.js"
+    FAKE_JS = '(globalThis.TURBOPACK||(globalThis.TURBOPACK=[])).push([null,98226,(e,t,n)=>{t.exports=()=>{}}])'
+
+    captured = []
 
     async with async_playwright() as pw:
-        browser, context = await setup_context(pw)
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800}
+        )
+
+        # Injeta cookie de autenticação
+        if access_token:
+            await context.add_cookies([{
+                "name": "accessToken",
+                "value": access_token,
+                "domain": "detetiveforense.com",
+                "path": "/",
+                "httpOnly": True,
+                "secure": True
+            }])
+            print("[Cookie] accessToken injetado!")
+
         page = await context.new_page()
-        page.on('console', lambda m: print(f'[JS {m.type}] {m.text[:100]}') if m.type in ('warning', 'error') else None)
-        print('[Worker] Chrome OK')
 
-        # Login inicial
-        print('[Worker] Fazendo login...')
-        logged = await login_detetive(page)
-        print(f'[Worker] Login: {"OK" if logged else "FALHOU"}')
+        # Bloqueia DevtoolDisabler
+        async def handle_route(route):
+            if DEVTOOL_CHUNK in route.request.url:
+                print(f"[Bypass] Bloqueado: {route.request.url[-40:]}")
+                await route.fulfill(status=200, content_type="application/javascript", body=FAKE_JS)
+            else:
+                await route.continue_()
 
-        last_fs   = 0
-        last_ntfy = 0
+        await page.route("**/*", handle_route)
 
-        while True:
-            now = time.time()
-            if RUN_DURATION > 0 and (now - start) >= RUN_DURATION:
-                print(f'[Worker] {RUN_DURATION}s atingido. Encerrando.')
-                break
+        # Captura requests de consulta
+        def on_request(req):
+            url = req.url
+            if "detetiveforense.com/api/" in url:
+                skip = ["auth", "notification", "users/me", "users/balance", "last-not"]
+                if not any(s in url for s in skip):
+                    captured.append({"url": url, "method": req.method})
+                    print(f"[API Req] {req.method} {url}")
 
-            queue = []
-
-            # Poll Firestore a cada 20s
-            if now - last_fs >= POLL_SEC:
-                last_fs = now
-                try:
-                    queue += fs_query_processing()
-                except Exception as e:
-                    print(f'[Worker] Firestore erro: {e}')
-
-            # Poll ntfy a cada 5s
-            if now - last_ntfy >= NTFY_SEC:
-                last_ntfy = now
-                try:
-                    for oid in ntfy_poll():
-                        if oid and oid not in processed:
-                            try:
-                                doc = fs_get(f'orders/{oid}')
-                                f   = doc.get('fields', {})
-                                g   = lambda k: (f.get(k) or {}).get('stringValue') or ''
-                                if g('status') != 'done':
-                                    queue.append({'id': oid, 'productId': g('productId'),
-                                                  'productName': g('productName'), 'queryData': g('queryData')})
-                            except Exception as e:
-                                print(f'[Worker] ntfy order erro: {e}')
-                except Exception as e:
-                    print(f'[Worker] ntfy erro: {e}')
-
-            for order in queue:
-                oid = order['id']
-                if oid in processed:
-                    continue
-                processed.add(oid)
-
-                # Verifica se já processado
-                try:
-                    doc = fs_get(f'orders/{oid}')
-                    if (doc.get('fields', {}).get('status') or {}).get('stringValue') == 'done':
-                        continue
-                except:
-                    pass
-
-                print(f'[Worker] Processando {oid}: {order["productId"]} / {order["queryData"]}')
-                try:
-                    # Re-login se necessário
-                    if 'detetiveforense' not in page.url:
-                        await login_detetive(page)
-
-                    raw = await consultar(page, order['productId'], order['queryData'])
-                    if not raw or len(raw) < 30:
-                        print(f'[Worker] Resultado vazio, re-logando...')
-                        await login_detetive(page)
-                        raw = await consultar(page, order['productId'], order['queryData'])
-
-                    resultado = formatar(raw, order.get('productName', order['productId']), order['queryData'])
-                    fs_save(oid, resultado)
-                    print(f'[Worker] OK {oid} ({len(resultado)} chars)')
-
-                except Exception as e:
-                    print(f'[Worker] ERRO {oid}: {e}')
+        async def on_response(resp):
+            url = resp.url
+            if "detetiveforense.com/api/" in url:
+                skip = ["auth", "notification", "users/me", "users/balance", "last-not"]
+                if not any(s in url for s in skip):
                     try:
-                        fs_error(oid, str(e))
-                    except:
-                        pass
-                    try:
-                        await login_detetive(page)
+                        body = await resp.body()
+                        print(f"[API Resp] {resp.status} {url} | body({len(body)}): {body[:100]}")
                     except:
                         pass
 
-            await asyncio.sleep(NTFY_SEC)
+        page.on("request", on_request)
+        page.on("response", lambda r: asyncio.ensure_future(on_response(r)))
+
+        # Navega para o módulo (deve estar logado pelo cookie)
+        print("[Nav] Indo para módulo investigador-osint...")
+        r = await page.goto(f"{BASE}/app/modulos/investigador-osint", wait_until="domcontentloaded", timeout=25000)
+        print(f"[Nav] status={r.status if r else 'None'}, url={page.url}")
+        await page.wait_for_timeout(3000)
+
+        # Verifica se está logado
+        body_text = ""
+        try:
+            body_text = await page.inner_text("body")
+            print(f"[Page] Body (300c): {body_text[:300]}")
+        except:
+            pass
+
+        # Procura input e preenche CPF de teste
+        try:
+            inputs = await page.query_selector_all("input")
+            print(f"[Form] {len(inputs)} inputs encontrados")
+            for inp in inputs:
+                ph = await inp.get_attribute("placeholder") or ""
+                tp = await inp.get_attribute("type") or ""
+                print(f"  input: placeholder='{ph}', type='{tp}'")
+
+            if inputs:
+                await inputs[0].fill("077.349.584-00")
+                await page.wait_for_timeout(800)
+                await page.keyboard.press("Enter")
+                print("[Form] CPF preenchido e Enter pressionado!")
+                await page.wait_for_timeout(8000)
+                print(f"[Nav] URL após submit: {page.url}")
+        except Exception as e:
+            print(f"[Form] Erro: {e}")
+
+        print(f"\n[Result] Requests capturadas: {json.dumps(captured, indent=2)}")
+        await browser.close()
+
+    if RUN_DURATION > 0:
+        import time
+        elapsed = 120
+        remaining = RUN_DURATION - elapsed
+        if remaining > 0:
+            print(f"[Worker] Aguardando {remaining}s...")
+            time.sleep(remaining)
 
 asyncio.run(main())
