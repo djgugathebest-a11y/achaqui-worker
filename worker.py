@@ -225,10 +225,13 @@ def formatar_resultado(raw_text, product_name, query_data):
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 async def main():
-    print('[Achaqui Worker] Iniciando...')
+    import sys; sys.stdout.flush()
+    print('[Achaqui Worker] Iniciando...', flush=True)
     processed = set()  # evita reprocessar
 
+    print("[Worker] Iniciando Playwright...", flush=True)
     async with async_playwright() as pw:
+        print("[Worker] Playwright OK, lancando Chrome...", flush=True)
         browser = await pw.chromium.launch(
             headless=True,
             args=[
@@ -247,6 +250,7 @@ async def main():
         )
         # context já criado acima com stealth settings
         page    = await context.new_page()
+        print("[Worker] Chrome OK, pagina criada", flush=True)
 
         # Login inicial
         print('[Worker] Fazendo login no Detetive Forense...')
