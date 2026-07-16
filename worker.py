@@ -272,22 +272,41 @@ async def login_detetive(page):
         await page.fill('input[placeholder="Digite sua senha"]', DF_PASS)
         await page.wait_for_timeout(400)
         await page.click('button:has-text("Entrar")')
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(5000)
         print(f'[Login] Após submit: {page.url}')
+
+        # Log do body para debug
+        try:
+            body_after = await page.inner_text('body')
+            print(f'[Login] Body pós-submit (300c): {body_after[:300]}')
+        except:
+            pass
 
         # PIN se necessário
         try:
-            pin = await page.query_selector('input[maxlength="6"]')
+            pin = await page.query_selector('input[maxlength="6"], input[placeholder*="PIN"], input[placeholder*="pin"]')
             if pin:
                 print('[Login] PIN solicitado...')
                 await pin.fill(DF_PIN)
                 await page.keyboard.press('Enter')
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(4000)
                 print(f'[Login] Após PIN: {page.url}')
+                try:
+                    body_pin = await page.inner_text('body')
+                    print(f'[Login] Body pós-PIN (300c): {body_pin[:300]}')
+                except:
+                    pass
         except:
             pass
 
-        return '/app/' in page.url or 'detetiveforense' in page.url
+        # Aguarda redirect para /app/ com até 10s
+        try:
+            await page.wait_for_url('**/app/**', timeout=10000)
+            print(f'[Login] Redirect para /app/ detectado: {page.url}')
+        except:
+            print(f'[Login] Sem redirect para /app/ após 10s. URL: {page.url}')
+
+        return '/app/' in page.url
 
     except Exception as e:
         print(f'[Login] Formulário não encontrado: {e}')
