@@ -163,18 +163,53 @@ async def consultar(page, product_id, query_data):
     return result or ''
 
 async def login_detetive(page):
-    await page.goto('https://detetiveforense.com/auth/login', wait_until='domcontentloaded', timeout=20000)
-    await page.wait_for_timeout(1000)
-
-    # Preenche login
-    await page.fill('input[name="username"], input[placeholder*="usuário"], input[type="text"]', 'edson102')
-    await page.fill('input[name="password"], input[placeholder*="senha"], input[type="password"]', '123456789')
-    await page.click('button[type="submit"], button:has-text("Entrar")')
+    await page.goto('https://detetiveforense.com/auth/login', wait_until='networkidle', timeout=30000)
     await page.wait_for_timeout(2000)
+
+    # Aguarda campo de usuário aparecer
+    try:
+        await page.wait_for_selector('input[type="text"], input[name="username"], input[placeholder*="usu"]', timeout=10000)
+    except:
+        print('[Login] Campo usuario não encontrado, aguardando mais...')
+        await page.wait_for_timeout(3000)
+
+    # Preenche usuário
+    try:
+        await page.fill('input[name="username"]', 'edson102')
+    except:
+        try:
+            await page.fill('input[type="text"]', 'edson102')
+        except:
+            inputs = await page.query_selector_all('input')
+            if inputs:
+                await inputs[0].fill('edson102')
+
+    await page.wait_for_timeout(500)
+
+    # Aguarda campo de senha aparecer (pode ser step 2)
+    try:
+        await page.wait_for_selector('input[type="password"]', timeout=5000)
+    except:
+        # Tenta clicar em próximo/continuar se for multi-step
+        try:
+            await page.click('button[type="submit"], button:has-text("Próximo"), button:has-text("Continuar")')
+            await page.wait_for_timeout(2000)
+            await page.wait_for_selector('input[type="password"]', timeout=10000)
+        except:
+            print('[Login] Campo senha não encontrado após step 1')
+
+    # Preenche senha
+    try:
+        await page.fill('input[type="password"]', '123456789')
+    except Exception as e:
+        print(f'[Login] Erro ao preencher senha: {e}')
+
+    await page.click('button[type="submit"], button:has-text("Entrar")')
+    await page.wait_for_timeout(3000)
 
     # PIN se necessário
     try:
-        pin_input = await page.query_selector('input[placeholder*="PIN"], input[placeholder*="pin"]')
+        pin_input = await page.query_selector('input[placeholder*="PIN"], input[placeholder*="pin"], input[maxlength="6"]')
         if pin_input:
             await pin_input.fill('162738')
             await page.click('button[type="submit"], button:has-text("Confirmar"), button:has-text("Entrar")')
