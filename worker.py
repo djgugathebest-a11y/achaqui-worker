@@ -1,24 +1,38 @@
 """
-Achaqui Worker — processa pedidos do Firestore via Playwright
-Roda em loop no Railway, 24/7
+Achaqui Worker — processa pedidos do Firestore via Playwright + curl_cffi
+Roda em loop no GitHub Actions (5min cron) ou Railway (24/7)
 """
 
 import asyncio
 import json
 import os
+import re
 import time
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
 from playwright.async_api import async_playwright
 
+try:
+    from curl_cffi import requests as cf_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+    print("[Worker] curl_cffi nao disponivel, usando Playwright puro")
+
 # ── Config ──────────────────────────────────────────────────────────────────
 FK       = os.environ.get('FIREBASE_API_KEY', 'AIzaSyAoZYnDTl8WoCG5K3q6hjFQnVFmkAS6PZ8')
-FS_BASE  = f'https://firestore.googleapis.com/v1/projects/bancadamatriz-9f797/databases/(default)/documents'
+FS_BASE  = 'https://firestore.googleapis.com/v1/projects/bancadamatriz-9f797/databases/(default)/documents'
 NTFY     = 'https://ntfy.sh/achaqui-zapia-guga-secret-2025'
-POLL_SEC = 20   # verifica Firestore a cada 20s
-NTFY_SEC = 5    # verifica ntfy a cada 5s
-RUN_DURATION = int(os.environ.get("RUN_DURATION", "0"))  # 0=infinito; >0=GitHub Actions
+POLL_SEC = 20
+NTFY_SEC = 5
+RUN_DURATION = int(os.environ.get("RUN_DURATION", "0"))
+
+DF_LOGIN_URL = 'https://detetiveforense.com/auth/login'
+DF_BASE      = 'https://detetiveforense.com'
+DF_USER      = 'edson102'
+DF_PASS      = '123456789'
+DF_PIN       = '162738'
 
 # ── Firestore helpers ────────────────────────────────────────────────────────
 def fs_request(path, method='GET', body=None):
@@ -51,7 +65,7 @@ def fs_query_processing():
             continue
         f   = d['document']['fields']
         oid = d['document']['name'].split('/')[-1]
-        g   = lambda k: (f.get(k) or {}).get('stringValue') or (f.get(k) or {}).get('integerValue') or ''
+        g   = lambda k, f=f: (f.get(k) or {}).get('stringValue') or (f.get(k) or {}).get('integerValue') or ''
         orders.append({
             'id':          oid,
             'productId':   g('productId'),
@@ -84,7 +98,7 @@ def fs_mark_error(order_id, msg):
     url   = f'{FS_BASE}/{path}?key={FK}&{mask}'
     body  = {"fields": {
         "status": {"stringValue": "error"},
-        "result": {"stringValue": f"⚠️ Erro no processamento: {msg}\n\nEntre em contato com o suporte: +55 68 98101-4570"},
+        "result": {"stringValue": f"Erro no processamento: {msg}\n\nContato suporte: +55 68 98101-4570"},
     }}
     req = urllib.request.Request(url,
           data=json.dumps(body).encode(),
@@ -93,7 +107,6 @@ def fs_mark_error(order_id, msg):
         r.read()
 
 def ntfy_poll():
-    """Retorna lista de orderIds recebidos via ntfy nos últimos 2min."""
     try:
         url = f'{NTFY}/json?poll=1&since=2m'
         req = urllib.request.Request(url, headers={'Accept': 'application/json'})
@@ -101,250 +114,277 @@ def ntfy_poll():
             raw = r.read().decode()
         ids = []
         for line in raw.strip().split('\n'):
-            if not line: continue
+            if not line:
+                continue
             try:
                 msg = json.loads(line)
-                if msg.get('title') == 'ACHAQUI_PEDIDO':
-                    body = json.loads(msg.get('message', '{}'))
-                    oid  = body.get('orderId')
-                    if oid and oid != 'teste123':
-                        ids.append({'id': oid,
-                                    'productId':  body.get('productId', ''),
-                                    'productName': body.get('productName', ''),
-                                    'queryData':  body.get('queryData', '')})
-            except: pass
+                if msg.get('event') == 'message':
+                    ids.append(msg.get('message', '').strip())
+            except:
+                pass
         return ids
-    except Exception as e:
-        print(f'[ntfy] erro: {e}')
+    except:
         return []
 
-# ── Detetive Forense via Playwright ─────────────────────────────────────────
-MODULE_MAP = {
-    'placa':            'placa',
-    'placa-basica':     'placa',
-    'placa-completa':   'placa',
-    'placa-historico':  'placa',
-}
-# Todos os outros módulos usam investigador-osint
+# ── Login via curl_cffi ──────────────────────────────────────────────────────
+def login_via_curl_cffi():
+    """Login via HTTP real (curl_cffi impersonando Chrome), retorna (cookies, session)."""
+    print("[Login] Iniciando via curl_cffi (bypass Cloudflare)...")
+    session = cf_requests.Session(impersonate="chrome124")
 
-async def consultar(page, product_id, query_data):
-    query_clean = ''.join(c for c in query_data if c.isalnum())
+    r = session.get(DF_LOGIN_URL, timeout=20)
+    print(f"[Login] GET login: {r.status_code}, URL final: {r.url}")
+    if r.status_code != 200:
+        raise Exception(f"Pagina de login retornou {r.status_code}")
 
-    # Decide módulo
-    modulo = MODULE_MAP.get(product_id, 'investigador-osint')
+    # Extrai CSRF se existir
+    csrf_match = re.search(r'"csrfToken"\s*:\s*"([^"]+)"', r.text)
+    csrf_token = csrf_match.group(1) if csrf_match else None
+    if csrf_token:
+        print(f"[Login] CSRF: {csrf_token[:20]}...")
 
-    await page.goto(f'https://detetiveforense.com/app/modulos/{modulo}', wait_until='domcontentloaded', timeout=30000)
-    await page.wait_for_timeout(1500)
+    # Detecta a estrutura da API de login
+    login_payload = {"usuario": DF_USER, "senha": DF_PASS}
+    headers = {
+        "Content-Type": "application/json",
+        "Referer": DF_LOGIN_URL,
+        "Origin": DF_BASE,
+    }
+    if csrf_token:
+        headers["X-CSRF-Token"] = csrf_token
 
-    if modulo == 'investigador-osint':
-        await page.fill('input[placeholder*="CPF"], input[aria-label*="CPF"]', query_clean)
-    elif modulo == 'placa':
-        await page.fill('input[placeholder*="Placa"], input[aria-label*="Placa"]', query_clean.upper())
-
-    await page.click('button:has-text("Pesquisar")')
-    await page.wait_for_timeout(6000)
-
-    # Tenta esperar algum resultado
-    try:
-        await page.wait_for_selector('dialog[open], [role="dialog"]', timeout=15000)
-    except:
-        pass
-
-    # Extrai texto do modal/resultado
-    result = await page.evaluate('''() => {
-        // Tenta pegar o modal de detalhes
-        const dialog = document.querySelector('dialog[open]');
-        if (dialog) return dialog.innerText;
-        // Tenta pegar área de resultado
-        const res = document.querySelector('[class*="result"], [class*="detail"], [class*="modal"]');
-        if (res) return res.innerText;
-        return document.body.innerText.substring(0, 5000);
-    }''')
-
-    return result or ''
-
-async def login_detetive(page):
-    for attempt in range(3):
+    login_ok = False
+    for endpoint in ["/api/auth/login", "/api/login", "/api/users/login", "/auth/login"]:
         try:
-            await page.goto('https://detetiveforense.com/auth/login', wait_until='domcontentloaded', timeout=20000)
-            await page.wait_for_timeout(2000)
-            if page.url != 'about:blank' and 'detetiveforense' in page.url:
-                break
-            print(f'[Login] Tentativa {attempt+1}: URL={page.url}')
-            await page.wait_for_timeout(2000)
+            r2 = session.post(f"{DF_BASE}{endpoint}", json=login_payload, headers=headers, timeout=15)
+            print(f"[Login] POST {endpoint}: {r2.status_code} — {r2.text[:150]}")
+            if r2.status_code in [200, 201]:
+                body = r2.json() if r2.text else {}
+                if body.get('token') or body.get('accessToken') or body.get('success'):
+                    login_ok = True
+                    print(f"[Login] Login via API OK!")
+                    # Guarda token JWT se houver
+                    token = body.get('token') or body.get('accessToken') or body.get('jwt')
+                    if token:
+                        session.headers.update({'Authorization': f'Bearer {token}'})
+                    break
         except Exception as e:
-            print(f'[Login] goto erro tentativa {attempt+1}: {e}')
-            await page.wait_for_timeout(3000)
-    await page.wait_for_timeout(1500)
+            print(f"[Login] {endpoint} erro: {e}")
 
-    # Debug: tira screenshot para ver o que o Playwright está vendo
+    if not login_ok:
+        print("[Login] API login nao funcionou, retornando cookies da sessao mesmo assim")
+
+    cookies = dict(session.cookies)
+    print(f"[Login] Cookies: {list(cookies.keys())}")
+    return cookies, session
+
+# ── Login via Playwright ─────────────────────────────────────────────────────
+async def login_detetive_playwright(page, pre_cookies=None):
+    if pre_cookies:
+        print("[Login] Injetando cookies no Playwright...")
+        cookie_list = [
+            {"name": k, "value": v, "domain": "detetiveforense.com", "path": "/"}
+            for k, v in pre_cookies.items()
+        ]
+        await page.context.add_cookies(cookie_list)
+
     try:
-        await page.screenshot(path='/tmp/login_debug.png', full_page=True)
-    except: pass
-    
-    # Loga o título e URL atual
-    print(f'[Login] URL: {page.url}, título: {await page.title()}')
-    
-    # Loga o HTML para debug
+        await page.goto(DF_LOGIN_URL, wait_until='domcontentloaded', timeout=20000)
+        await page.wait_for_timeout(2000)
+    except Exception as e:
+        print(f"[Login] goto erro: {e}")
+
+    current_url = page.url
+    title = await page.title()
+    print(f"[Login] URL: {current_url} | titulo: {title}")
+
+    # Tenta obter conteúdo da página
     try:
-        body = await page.inner_text('body')
-        print(f'[Login] Primeiros 500 chars da página: {body[:500]}')
-    except: pass
-
-    # Aguarda campo Usuário (placeholder exato: "Digite seu usuário")
-    await page.wait_for_selector('input[placeholder="Digite seu usuário"]', timeout=25000)
-
-    await page.fill('input[placeholder="Digite seu usuário"]', 'edson102')
-    await page.wait_for_timeout(300)
-    await page.fill('input[placeholder="Digite sua senha"]', '123456789')
-    await page.wait_for_timeout(300)
-    await page.click('button:has-text("Entrar")')
-    await page.wait_for_timeout(3000)
-
-    # PIN se necessário
-    try:
-        pin_input = await page.query_selector('input[placeholder*="PIN"], input[placeholder*="pin"], input[maxlength="6"]')
-        if pin_input:
-            await pin_input.fill('162738')
-            await page.click('button:has-text("Confirmar"), button:has-text("Entrar")')
-            await page.wait_for_timeout(2000)
+        body_text = await page.inner_text('body')
+        print(f"[Login] Body (200 chars): {body_text[:200]}")
     except:
         pass
+
+    # Se já logado
+    if '/app/' in current_url or '/dashboard' in current_url:
+        print("[Login] Ja autenticado!")
+        return True
+
+    # Tenta formulário
+    try:
+        await page.wait_for_selector('input[placeholder="Digite seu usuario"]', timeout=8000)
+        print("[Login] Formulario encontrado!")
+        await page.fill('input[placeholder="Digite seu usuario"]', DF_USER)
+        await page.wait_for_timeout(300)
+        await page.fill('input[placeholder="Digite sua senha"]', DF_PASS)
+        await page.wait_for_timeout(300)
+        await page.click('button:has-text("Entrar")')
+        await page.wait_for_timeout(3000)
+        try:
+            pin = await page.query_selector('input[maxlength="6"]')
+            if pin:
+                await pin.fill(DF_PIN)
+                await page.keyboard.press('Enter')
+                await page.wait_for_timeout(2000)
+        except:
+            pass
+        print(f"[Login] Apos submit: {page.url}")
+        return True
+    except Exception as e:
+        print(f"[Login] Formulario nao encontrado: {e}")
+        return False
+
+# ── Consulta ─────────────────────────────────────────────────────────────────
+async def consultar(page, modulo, query_data):
+    url = f'https://detetiveforense.com/app/modulos/{modulo}'
+    await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+    await page.wait_for_timeout(2000)
+    print(f"[Consulta] URL: {page.url}")
+
+    input_sel = 'input[placeholder], input[type="text"], input[type="search"]'
+    await page.wait_for_selector(input_sel, timeout=15000)
+    inputs = await page.query_selector_all(input_sel)
+    if inputs:
+        await inputs[0].fill(query_data)
+        await page.wait_for_timeout(500)
+        try:
+            btn = await page.query_selector('button[type="submit"], button:has-text("Buscar"), button:has-text("Pesquisar")')
+            if btn:
+                await btn.click()
+            else:
+                await inputs[0].press('Enter')
+        except:
+            await inputs[0].press('Enter')
+
+    await page.wait_for_timeout(5000)
+    try:
+        return await page.inner_text('main, [class*="result"], [class*="card"], article')
+    except:
+        return await page.inner_text('body')
 
 def formatar_resultado(raw_text, product_name, query_data):
-    now = datetime.now().strftime('%d/%m/%Y às %H:%M')
+    now = datetime.now().strftime('%d/%m/%Y as %H:%M')
     linhas = [l.strip() for l in raw_text.split('\n') if l.strip()]
-    # Remove linhas de UI
     skip_words = ['Copiar Dados', 'Exportar PDF', 'Adicionar em', 'Fechar', 'Buscar Mandados',
-                  'Validar Foto', 'Galeria de Fotos', 'Foto de Referência', '100% gratuito',
-                  'Busca em tempo real', 'caráter histórico']
+                  'Validar Foto', 'Galeria de Fotos', '100% gratuito', 'Busca em tempo real']
     linhas = [l for l in linhas if not any(s in l for s in skip_words)]
-
-    out  = f'🔍 RELATÓRIO DE CONSULTA — ACHAQUI\n'
-    out += f'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
+    out  = '🔍 RELATORIO DE CONSULTA — ACHAQUI\n'
+    out += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
     out += f'📋 Produto: {product_name}\n'
-    out += f'🔎 Dado consultado: {query_data}\n'
-    out += f'📅 Data/Hora: {now}\n'
-    out += f'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
-    out += '\n'.join(linhas[:200])
-    out += f'\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
-    out += f'🕵️ Relatório gerado por Achaqui\n'
-    out += f'🔒 Documento confidencial — uso exclusivo do solicitante\n'
-    out += f'achaqui.vercel.app'
+    out += f'🔎 Dado: {query_data}\n'
+    out += f'📅 Data: {now}\n'
+    out += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
+    out += '\n'.join(linhas[:80])
     return out
 
-# ── Main loop ────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 async def main():
-    import sys; sys.stdout.flush()
-    print('[Achaqui Worker] Iniciando...', flush=True)
-    processed = set()  # evita reprocessar
+    print('[Achaqui Worker] Iniciando...')
+    processed = set()
 
-    print("[Worker] Iniciando Playwright...", flush=True)
+    pre_cookies = None
+    if HAS_CURL_CFFI:
+        try:
+            pre_cookies, _ = login_via_curl_cffi()
+        except Exception as e:
+            print(f"[Worker] curl_cffi falhou: {e}")
+
+    print("[Worker] Iniciando Playwright...")
     async with async_playwright() as pw:
-        print("[Worker] Playwright OK, lancando Chrome...", flush=True)
         browser = await pw.chromium.launch(
             headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-infobars',
-                '--window-size=1280,800',
-            ]
+            args=['--no-sandbox', '--disable-dev-shm-usage',
+                  '--disable-blink-features=AutomationControlled', '--window-size=1280,800']
         )
         context = await browser.new_context(
-            user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+            user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             viewport={'width': 1280, 'height': 800},
             locale='pt-BR',
             timezone_id='America/Sao_Paulo',
         )
-        # context já criado acima com stealth settings
-        page    = await context.new_page()
-        print("[Worker] Chrome OK, pagina criada", flush=True)
+        page = await context.new_page()
+        print("[Worker] Chrome OK")
 
-        # Login inicial
-        print('[Worker] Fazendo login no Detetive Forense...')
+        print('[Worker] Fazendo login...')
         try:
-            await login_detetive(page)
-            print('[Worker] Login OK')
+            ok = await login_detetive_playwright(page, pre_cookies)
+            print(f'[Worker] Login {"OK" if ok else "falhou, continuando"}')
         except Exception as e:
-            print(f'[Worker] Erro no login: {e}')
+            print(f'[Worker] Erro login: {e}')
 
-        last_fs_check  = 0
+        last_fs_check   = 0
         last_ntfy_check = 0
-        start_time = time.time()
+        start_time      = time.time()
 
         while True:
             now = time.time()
             if RUN_DURATION > 0 and (now - start_time) >= RUN_DURATION:
-                print(f"[Worker] Tempo {RUN_DURATION}s atingido. Encerrando para proximo ciclo.")
+                print(f'[Worker] Tempo {RUN_DURATION}s atingido. Encerrando.')
                 break
+
             orders_to_process = []
 
-            # Verifica Firestore a cada 20s
             if now - last_fs_check >= POLL_SEC:
                 last_fs_check = now
                 try:
                     orders_to_process += fs_query_processing()
                 except Exception as e:
-                    print(f'[Firestore] Erro: {e}')
+                    print(f'[Worker] Erro Firestore: {e}')
 
-            # Verifica ntfy a cada 5s
             if now - last_ntfy_check >= NTFY_SEC:
                 last_ntfy_check = now
                 try:
-                    ntfy_orders = ntfy_poll()
-                    for o in ntfy_orders:
-                        if o['id'] not in [x['id'] for x in orders_to_process]:
-                            orders_to_process.append(o)
+                    for oid in ntfy_poll():
+                        if oid and oid not in processed:
+                            try:
+                                doc = fs_request(f'orders/{oid}')
+                                f = doc.get('fields', {})
+                                g = lambda k, f=f: (f.get(k) or {}).get('stringValue') or ''
+                                if g('status') != 'done':
+                                    orders_to_process.append({
+                                        'id': oid, 'productId': g('productId'),
+                                        'productName': g('productName'), 'queryData': g('queryData'),
+                                    })
+                            except Exception as e:
+                                print(f'[Worker] ntfy order {oid}: {e}')
                 except Exception as e:
-                    print(f'[ntfy] Erro: {e}')
+                    print(f'[Worker] ntfy poll erro: {e}')
 
-            # Processa pedidos únicos não processados nessa sessão
             for order in orders_to_process:
                 oid = order['id']
                 if oid in processed:
                     continue
-
-                # Busca dados completos do pedido se veio do ntfy
-                if not order.get('queryData'):
-                    try:
-                        doc = fs_request(f'orders/{oid}')
-                        f   = doc.get('fields', {})
-                        g   = lambda k: (f.get(k) or {}).get('stringValue', '')
-                        order['productId']   = g('productId')
-                        order['productName'] = g('productName')
-                        order['queryData']   = g('queryData')
-                        if g('status') == 'done':
-                            processed.add(oid)
-                            continue
-                    except Exception as e:
-                        print(f'[Worker] Erro ao buscar pedido {oid}: {e}')
+                try:
+                    doc = fs_request(f'orders/{oid}')
+                    f = doc.get('fields', {})
+                    g = lambda k, f=f: (f.get(k) or {}).get('stringValue') or ''
+                    if g('status') == 'done':
+                        processed.add(oid)
                         continue
+                except Exception as e:
+                    print(f'[Worker] Erro buscar {oid}: {e}')
+                    continue
 
                 print(f'[Worker] Processando {oid}: {order["productId"]} / {order["queryData"]}')
                 processed.add(oid)
-
                 try:
                     raw = await consultar(page, order['productId'], order['queryData'])
                     if not raw or len(raw) < 50:
-                        # Tenta relogin e consulta novamente
-                        await login_detetive(page)
+                        await login_detetive_playwright(page, pre_cookies)
                         raw = await consultar(page, order['productId'], order['queryData'])
-
                     resultado = formatar_resultado(raw, order.get('productName', order['productId']), order['queryData'])
                     fs_save_result(oid, resultado)
-                    print(f'[Worker] ✅ {oid} processado ({len(resultado)} chars)')
-
+                    print(f'[Worker] OK {oid} ({len(resultado)} chars)')
                 except Exception as e:
-                    print(f'[Worker] ❌ Erro ao processar {oid}: {e}')
+                    print(f'[Worker] ERRO {oid}: {e}')
                     try:
                         fs_mark_error(oid, str(e)[:200])
-                    except: pass
-                    # Tenta relogin para próximo
+                    except:
+                        pass
                     try:
-                        await login_detetive(page)
-                    except: pass
+                        await login_detetive_playwright(page, pre_cookies)
+                    except:
+                        pass
 
             await asyncio.sleep(NTFY_SEC)
 
