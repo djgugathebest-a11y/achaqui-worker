@@ -173,10 +173,27 @@ async def consultar(page, module_info, query_data):
     print(f'[Consulta] Query original: {query_data!r} -> limpo: {query_clean!r}')
     query_data = query_clean
 
+    # Refresh cookie antes de cada consulta (token pode expirar no container)
+    try:
+        new_token = api_login()
+        if new_token:
+            await page.context.add_cookies([{
+                'name': 'accessToken', 'value': new_token,
+                'domain': 'detetiveforense.com', 'path': '/', 'httpOnly': True, 'secure': True
+            }])
+            print(f'[Consulta] Cookie refreshed: {new_token[:20]}...')
+    except Exception as e:
+        print(f'[Consulta] Refresh erro: {e}')
+
     # Navega para o módulo
-    await page.goto(url, wait_until='domcontentloaded', timeout=20000)
+    await page.goto(url, wait_until='domcontentloaded', timeout=25000)
     await page.wait_for_timeout(3000)
     print(f'[Consulta] URL: {page.url}')
+
+    # Se caiu na página de login, o cookie falhou
+    if '/auth/login' in page.url:
+        print('[Consulta] Redirecionado para login! Aguardando...')
+        await page.wait_for_timeout(3000)
 
     # Preenche via page.type() - simula digitação real (funciona com React Hook Form)
     try:
