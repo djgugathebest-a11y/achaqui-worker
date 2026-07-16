@@ -225,33 +225,41 @@ async def consultar(page, module_info, query_data):
     print(f'[Consulta] Form submit: {result}')
 
 
-    # Aguarda resultado aparecer na página (10s)
-    # Aguarda resultado (15s para o React processar a Server Action)
-    await page.wait_for_timeout(15000)
+    # Aguarda resultado real (wait_for_selector robusto)
+    resultado_ok = False
+    try:
+        for rsel in ['text=Dados Pessoais', 'text=DADOS PESSOAIS', 'text=Nascimento', 'text=ENDEREÇOS', 'h2']:
+            try:
+                await page.wait_for_selector(rsel, timeout=6000, state='visible')
+                resultado_ok = True
+                print(f'[Consulta] Resultado detectado: {rsel}')
+                break
+            except:
+                continue
+    except:
+        pass
+    if not resultado_ok:
+        print('[Consulta] Sem resultado detectado, aguardando 15s...')
+        await page.wait_for_timeout(15000)
 
-    # Captura o conteúdo resultante
+    # Captura conteúdo
     try:
         content = await page.evaluate("""
             () => {
-                // Pega todo texto dos cards de resultado
-                const selectors = [
-                    '[class*="result"]', '[class*="card"]', 'main article',
-                    '[class*="consulta"]', '[class*="dados"]', 'main'
-                ];
-                for (const sel of selectors) {
+                const main = document.querySelector('main');
+                if (main && main.innerText && main.innerText.length > 200) return main.innerText;
+                for (const sel of ['[class*="result"]','[class*="card"]','[class*="dados"]','article']) {
                     const el = document.querySelector(sel);
-                    if (el && el.innerText && el.innerText.length > 100) {
-                        return el.innerText;
-                    }
+                    if (el && el.innerText && el.innerText.length > 200) return el.innerText;
                 }
                 return document.body.innerText;
             }
         """)
-        print(f'[Consulta] Resultado ({len(content)} chars): {content[:500]}')
+        print(f'[Consulta] Capturado ({len(content)} chars): {content[:500]}')
         return content
     except Exception as e:
         body = await page.inner_text('body')
-        print(f'[Consulta] Fallback ({len(body)} chars): {body[:500]}')
+        print(f'[Consulta] Fallback ({len(body)} chars): {body[:300]}')
         return body
 
 def formatar(raw, product_name, query_data):
