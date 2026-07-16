@@ -167,6 +167,12 @@ async def consultar(page, module_info, query_data):
     url = f"{BASE}{module_info['url']}"
     field = module_info['field']
 
+    # Sanitiza o query_data: remove formatação (pontos, traços, barras, espaços)
+    import re as _re
+    query_clean = _re.sub(r'[.\-/\s]', '', str(query_data).strip())
+    print(f'[Consulta] Query original: {query_data!r} -> limpo: {query_clean!r}')
+    query_data = query_clean
+
     # Navega para o módulo
     await page.goto(url, wait_until='domcontentloaded', timeout=20000)
     await page.wait_for_timeout(3000)
