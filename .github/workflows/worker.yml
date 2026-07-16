@@ -14,6 +14,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Fix libasound2 for Ubuntu 24
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libasound2t64
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libasound.so.2 /usr/lib/x86_64-linux-gnu/libasound.so.2.0.0 || true
+          # Cria alias do pacote para enganar o apt
+          sudo apt-get install -y libasound2 2>/dev/null || true
+
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -23,8 +31,10 @@ jobs:
       - name: Install Python deps
         run: pip install -r requirements.txt
 
-      - name: Install Playwright + deps (via playwright CLI)
-        run: python -m playwright install --with-deps chromium
+      - name: Install Playwright + deps
+        run: |
+          python -m playwright install --with-deps chromium || \
+          (python -m playwright install chromium && echo "installed without --with-deps")
 
       - name: Run worker (4 min loop)
         env:
