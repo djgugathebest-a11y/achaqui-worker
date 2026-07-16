@@ -240,6 +240,18 @@ async def consultar(page, module_info, query_data):
         result = {'status': 'error', 'msg': str(e)[:100]}
 
     print(f'[Consulta] Form submit: {result}')
+    # Debug: captura estado da página logo após o submit
+    try:
+        print(f'[Debug] URL após submit: {page.url}')
+        title = await page.title()
+        print(f'[Debug] Title: {title}')
+        body_txt = await page.inner_text('body')
+        print(f'[Debug] Body (500c): {body_txt[:500]}')
+        # Conta inputs visíveis
+        n_inputs = await page.evaluate("() => document.querySelectorAll('input:not([type=hidden])').length")
+        print(f'[Debug] Inputs visíveis: {n_inputs}')
+    except Exception as de:
+        print(f'[Debug] erro: {de}')
 
 
     # Aguarda resultado real (wait_for_selector robusto)
