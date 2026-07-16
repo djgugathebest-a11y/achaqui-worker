@@ -172,55 +172,52 @@ async def consultar(page, module_info, query_data):
     await page.wait_for_timeout(3000)
     print(f'[Consulta] URL: {page.url}')
 
-    # Usa JS para preencher e submeter o formulário React
-    # React Hook Form mantém estado interno — usamos nativeInputValueSetter
-    result = await page.evaluate(f"""
-        async () => {{
-            // Aguarda o React montar completamente
-            await new Promise(r => setTimeout(r, 2000));
+    # Preenche via page.type() - simula digitação real (funciona com React Hook Form)
+    try:
+        await page.wait_for_timeout(2000)
+        cpf_input = None
 
-            // Preenche o campo via React nativeInputValueSetter
-            const inputs = document.querySelectorAll('input');
-            let targetInput = null;
-            for (const inp of inputs) {{
-                if (inp.name === '{field}' || inp.placeholder && inp.placeholder.toLowerCase().includes('{field}')) {{
-                    targetInput = inp;
-                    break;
-                }}
-            }}
-            // Fallback: primeiro input de texto visível
-            if (!targetInput) {{
-                for (const inp of inputs) {{
-                    if (inp.type === 'text' && !inp.hidden && inp.offsetParent !== null) {{
-                        targetInput = inp;
-                        break;
-                    }}
-                }}
-            }}
-            if (!targetInput) return {{ error: 'Input não encontrado', inputs: inputs.length }};
+        # Tenta selectors em ordem de especificidade
+        for selector in [
+            f'input[name="{field}"]',
+            'input[inputmode="numeric"]',
+            'input[type="text"]:visible',
+            'input:visible',
+        ]:
+            try:
+                el = await page.wait_for_selector(selector, timeout=3000, state='visible')
+                if el:
+                    cpf_input = selector
+                    break
+            except:
+                continue
 
-            // Usa nativeInputValueSetter para acionar eventos React
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            nativeInputValueSetter.call(targetInput, '{query_data}');
-            targetInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            targetInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        if cpf_input:
+            await page.click(cpf_input)
+            await page.fill(cpf_input, '')
+            await page.type(cpf_input, query_data, delay=50)
+            await page.wait_for_timeout(500)
+            # Enter para submit
+            await page.keyboard.press('Enter')
+            await page.wait_for_timeout(1000)
+            # Tenta também clicar no botão de busca
+            for btn_sel in ['button[type="submit"]', 'button:has-text("Pesquisar")', 'button:has-text("Buscar")']:
+                try:
+                    btn = await page.query_selector(btn_sel)
+                    if btn:
+                        await btn.click()
+                        break
+                except:
+                    pass
+            result = {'status': 'typed', 'selector': cpf_input, 'value': query_data}
+        else:
+            result = {'status': 'no_input_found'}
 
-            await new Promise(r => setTimeout(r, 500));
+    except Exception as e:
+        result = {'status': 'error', 'msg': str(e)[:100]}
 
-            // Submete o formulário
-            const form = targetInput.closest('form');
-            if (form) {{
-                form.requestSubmit();
-                return {{ status: 'submitted', field: targetInput.name || targetInput.placeholder }};
-            }} else {{
-                // Tenta Enter
-                targetInput.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', keyCode: 13, bubbles: true }}));
-                targetInput.dispatchEvent(new KeyboardEvent('keyup', {{ key: 'Enter', keyCode: 13, bubbles: true }}));
-                return {{ status: 'enter_pressed', field: targetInput.name || targetInput.placeholder }};
-            }}
-        }}
-    """)
     print(f'[Consulta] Form submit: {result}')
+
 
     # Aguarda resultado aparecer na página (10s)
     # Aguarda resultado (15s para o React processar a Server Action)
