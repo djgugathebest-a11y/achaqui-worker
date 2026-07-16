@@ -164,7 +164,17 @@ async def consultar(page, product_id, query_data):
     return result or ''
 
 async def login_detetive(page):
-    await page.goto('https://detetiveforense.com/auth/login', wait_until='networkidle', timeout=30000)
+    for attempt in range(3):
+        try:
+            await page.goto('https://detetiveforense.com/auth/login', wait_until='domcontentloaded', timeout=20000)
+            await page.wait_for_timeout(2000)
+            if page.url != 'about:blank' and 'detetiveforense' in page.url:
+                break
+            print(f'[Login] Tentativa {attempt+1}: URL={page.url}')
+            await page.wait_for_timeout(2000)
+        except Exception as e:
+            print(f'[Login] goto erro tentativa {attempt+1}: {e}')
+            await page.wait_for_timeout(3000)
     await page.wait_for_timeout(1500)
 
     # Debug: tira screenshot para ver o que o Playwright está vendo
