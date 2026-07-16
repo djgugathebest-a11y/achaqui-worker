@@ -18,6 +18,7 @@ FS_BASE  = f'https://firestore.googleapis.com/v1/projects/bancadamatriz-9f797/da
 NTFY     = 'https://ntfy.sh/achaqui-zapia-guga-secret-2025'
 POLL_SEC = 20   # verifica Firestore a cada 20s
 NTFY_SEC = 5    # verifica ntfy a cada 5s
+RUN_DURATION = int(os.environ.get("RUN_DURATION", "0"))  # 0=infinito; >0=GitHub Actions
 
 # ── Firestore helpers ────────────────────────────────────────────────────────
 def fs_request(path, method='GET', body=None):
@@ -257,9 +258,13 @@ async def main():
 
         last_fs_check  = 0
         last_ntfy_check = 0
+        start_time = time.time()
 
         while True:
             now = time.time()
+            if RUN_DURATION > 0 and (now - start_time) >= RUN_DURATION:
+                print(f"[Worker] Tempo {RUN_DURATION}s atingido. Encerrando para proximo ciclo.")
+                break
             orders_to_process = []
 
             # Verifica Firestore a cada 20s
