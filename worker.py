@@ -166,6 +166,20 @@ async def login_detetive(page):
     await page.goto('https://detetiveforense.com/auth/login', wait_until='networkidle', timeout=30000)
     await page.wait_for_timeout(1500)
 
+    # Debug: tira screenshot para ver o que o Playwright está vendo
+    try:
+        await page.screenshot(path='/tmp/login_debug.png', full_page=True)
+    except: pass
+    
+    # Loga o título e URL atual
+    print(f'[Login] URL: {page.url}, título: {await page.title()}')
+    
+    # Loga o HTML para debug
+    try:
+        body = await page.inner_text('body')
+        print(f'[Login] Primeiros 500 chars da página: {body[:500]}')
+    except: pass
+
     # Aguarda campo Usuário (placeholder exato: "Digite seu usuário")
     await page.wait_for_selector('input[placeholder="Digite seu usuário"]', timeout=25000)
 
