@@ -1,57 +1,36 @@
+#!/usr/bin/env python3
 """
-Achaqui Worker — produção
-Estratégia: login via API (AES), cookie injetado no Playwright, consulta via form submit JS
-GitHub Actions 5min cron, loop interno 290s
+Achaqui Worker — Fix7 (Server Action direto, sem Playwright)
+============================================================
+Estratégia: login via API criptografada + consulta via Next.js Server Action
+- Sem Playwright, sem WebSocket, sem Socket.IO
+- Funciona 100% via HTTP com curl_cffi (impersonando Chrome)
+- A Server Action retorna os dados encriptados com o mesmo sistema dracula
 """
-import asyncio, json, os, base64, hashlib, re, time, urllib.request
-from datetime import datetime, timezone
+import os, json, time, re, base64, hashlib, asyncio
+from curl_cffi import requests as cf_req
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
-from curl_cffi import requests as cf_req
-from playwright.async_api import async_playwright
 
-try:
-    from playwright_stealth import Stealth
-    HAS_STEALTH = True
-except ImportError:
-    HAS_STEALTH = False
+# ── Configurações ──────────────────────────────────────────────────────────────
+BASE        = "https://detetiveforense.com"
+DF_USER     = "edson102"
+DF_PASS     = "123456789"
+DF_PIN      = "162738"
+FK          = os.environ.get("FIREBASE_API_KEY", "AIzaSyAoZYnDTl8WoCG5K3q6hjFQnVFmkAS6PZ8")
+FS_BASE     = "https://firestore.googleapis.com/v1/projects/bancadamatriz-9f797/databases/(default)/documents"
+NTFY_URL    = "https://ntfy.sh/achaqui-zapia-guga-secret-2025"
+RUN_SEC     = int(os.environ.get("RUN_DURATION", "290"))
 
-# ── Config ───────────────────────────────────────────────────────────────────
-FK          = os.environ.get('FIREBASE_API_KEY', 'AIzaSyAoZYnDTl8WoCG5K3q6hjFQnVFmkAS6PZ8')
-FS_BASE     = 'https://firestore.googleapis.com/v1/projects/bancadamatriz-9f797/databases/(default)/documents'
-NTFY        = 'https://ntfy.sh/achaqui-zapia-guga-secret-2025'
-POLL_SEC    = 20
-NTFY_SEC    = 5
-RUN_DURATION = int(os.environ.get('RUN_DURATION', '0'))
-
-BASE        = 'https://detetiveforense.com'
-DF_USER     = 'edson102'
-DF_PASS     = '123456789'
-DF_PIN      = '162738'
-DEVTOOL_CHUNK = '0888c0b2fc92ae80.js'
-FAKE_JS     = '(globalThis.TURBOPACK||(globalThis.TURBOPACK=[])).push([null,98226,(e,t,n)=>{t.exports=()=>{}}])'
-
-# Mapa productId -> módulo
-MODULE_MAP = {
-    'cpf-basico': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
-    'cpf-completo': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
-    'cpf-pro': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
-    'nome-cpf': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
-    'parentes': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
-    'historico-enderecos': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
-    'telefones': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
-    'foto-redes': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
-    'cnh-consulta': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
-    'historico-criminal': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
-    'processos-cpf': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
-    'score-credito': {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'},
-    'placa-basico': {'url': '/app/modulos/mega-placa', 'field': 'placa', 'tab': 'placa'},
-    'placa-historico': {'url': '/app/modulos/mega-placa-2', 'field': 'placa', 'tab': 'placa'},
-    'cnpj-basico': {'url': '/app/modulos/investigador-osint', 'field': 'cnpj', 'tab': 'documentos'},
+# ── Chave cripto ───────────────────────────────────────────────────────────────
+i_map = {
+    "utc":[77,114,88,110],"est":[55,76,98,72],"cst":[107,51,87,113],
+    "mst":[82,104,74,53],"pst":[100,65,111,89],"gmt":[70,115,54,106],
+    "cet":[113,78,103,52],"eet":[88,109,66,120],"ist":[57,85,116,75],
+    "jst":[108,71,56,99],"kst":[80,105,90,55],"nst":[101,68,110,83],
+    "hst":[66,119,77,97],"akt":[118,48,102,79],"wst":[106,81,72,114],
+    "aet":[51,107,89,69]
 }
-
-# ── Crypto ───────────────────────────────────────────────────────────────────
-i_map = {"utc":[77,114,88,110],"est":[55,76,98,72],"cst":[107,51,87,113],"mst":[82,104,74,53],"pst":[100,65,111,89],"gmt":[70,115,54,106],"cet":[113,78,103,52],"eet":[88,109,66,120],"ist":[57,85,116,75],"jst":[108,71,56,99],"kst":[80,105,90,55],"nst":[101,68,110,83],"hst":[66,119,77,97],"akt":[118,48,102,79],"wst":[106,81,72,114],"aet":[51,107,89,69]}
 KEY_O = ''.join(chr(v) for vals in i_map.values() for v in vals)
 
 def evp(pw, salt):
@@ -79,340 +58,347 @@ def decrypt_resp(ct):
     try:
         raw = json.loads(base64.b64decode(ct))
         if 'dracula' in raw:
-            d = raw['dracula']; kh = dec_str(d['encryptedAesKey'], KEY_O)
-            k, iv = bytes.fromhex(kh), bytes.fromhex(d['iv'])
-            return json.loads(unpad(AES.new(k, AES.MODE_CBC, iv).decrypt(base64.b64decode(d['encryptedText'])), 16).decode())
-    except: return None
+            d = raw['dracula']
+            kh = dec_str(d['encryptedAesKey'], KEY_O)
+            k = bytes.fromhex(kh); iv = bytes.fromhex(d['iv'])
+            return json.loads(unpad(AES.new(k, AES.MODE_CBC, iv).decrypt(base64.b64decode(d['encryptedText'])), 16))
+        return raw
+    except Exception as e:
+        return None
 
-# ── Firestore helpers ─────────────────────────────────────────────────────────
-def fs_req(path, method='GET', body=None):
-    url = f'{FS_BASE}/{path}?key={FK}'
-    data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'}, method=method)
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())
+# ── Server Action IDs (descobertos em 16/07/2026) ────────────────────────────
+SA_ACTIONS = {
+    'cpf':       '60cfed776b956422225588773edd905425a2a4d38f',
+    'documentos':'602f465b6303b9e7917ab450d8681d9b5d2658342d',
+    'nomeend':   '60144c075589c30f46302a88f0edd2cc868bf2e3c3',
+    'cnpj':      '6065bdbf8e8208d4a7caa4c637ba22a4258d3313e7',
+    'processos': '40c55c199ff135f2e28d88c87cc558dd13dd7e0080',
+}
 
-def fs_query():
-    url = f'{FS_BASE}:runQuery?key={FK}'
-    body = {"structuredQuery": {
-        "from": [{"collectionId": "orders"}],
-        "where": {"fieldFilter": {"field": {"fieldPath": "status"}, "op": "EQUAL", "value": {"stringValue": "processing"}}},
-        "limit": 5
-    }}
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'}, method='POST')
-    with urllib.request.urlopen(req, timeout=10) as r:
-        docs = json.loads(r.read())
-    orders = []
-    for d in docs:
-        if 'document' not in d: continue
-        f = d['document']['fields']
-        oid = d['document']['name'].split('/')[-1]
-        g = lambda k: (f.get(k) or {}).get('stringValue') or ''
-        orders.append({'id': oid, 'productId': g('productId'), 'productName': g('productName'), 'queryData': g('queryData')})
-    return orders
+# ── Mapa productId -> consulta ────────────────────────────────────────────────
+MODULE_MAP = {
+    'cpf-basico':          {'action': 'cpf',        'field': 'cpf'},
+    'cpf-completo':        {'action': 'cpf',        'field': 'cpf'},
+    'cpf-pro':             {'action': 'cpf',        'field': 'cpf'},
+    'nome-cpf':            {'action': 'cpf',        'field': 'cpf'},
+    'parentes':            {'action': 'cpf',        'field': 'cpf'},
+    'historico-enderecos': {'action': 'cpf',        'field': 'cpf'},
+    'telefones':           {'action': 'cpf',        'field': 'cpf'},
+    'foto-redes':          {'action': 'cpf',        'field': 'cpf'},
+    'processos':           {'action': 'processos',  'field': 'cpf'},
+    'cnpj-basico':         {'action': 'cnpj',       'field': 'cnpj'},
+    'cnpj-completo':       {'action': 'cnpj',       'field': 'cnpj'},
+    'nome-endereco':       {'action': 'nomeend',    'field': 'nome'},
+    'placa-veiculo':       {'action': 'documentos', 'field': 'placa'},
+}
 
-def fs_save(oid, result):
-    now = datetime.now(timezone.utc).isoformat()
-    fields = ['status', 'result', 'deliveredAt']
-    mask = '&'.join(f'updateMask.fieldPaths={f}' for f in fields)
-    url = f'{FS_BASE}/orders/{oid}?key={FK}&{mask}'
-    body = {"fields": {"status": {"stringValue": "done"}, "result": {"stringValue": result}, "deliveredAt": {"stringValue": now}}}
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'}, method='PATCH')
-    with urllib.request.urlopen(req, timeout=10) as r: r.read()
-
-def fs_error(oid, msg):
-    fields = ['status', 'result']
-    mask = '&'.join(f'updateMask.fieldPaths={f}' for f in fields)
-    url = f'{FS_BASE}/orders/{oid}?key={FK}&{mask}'
-    body = {"fields": {"status": {"stringValue": "error"}, "result": {"stringValue": f"⚠️ Erro: {msg[:200]}\n\nContato: +55 68 98101-4570"}}}
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'}, method='PATCH')
-    with urllib.request.urlopen(req, timeout=10) as r: r.read()
-
-def ntfy_poll():
-    try:
-        url = f'{NTFY}/json?poll=1&since=2m'
-        req = urllib.request.Request(url, headers={'Accept': 'application/json'})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            raw = r.read().decode()
-        ids = []
-        for line in raw.strip().split('\n'):
-            if not line: continue
-            try:
-                msg = json.loads(line)
-                if msg.get('event') == 'message': ids.append(msg.get('message','').strip())
-            except: pass
-        return ids
-    except: return []
-
-# ── Login via API ─────────────────────────────────────────────────────────────
+# ── Login ──────────────────────────────────────────────────────────────────────
 def api_login():
     s = cf_req.Session(impersonate="chrome124")
     s.get(f"{BASE}/auth/login", timeout=20)
     H = {"Content-Type": "text/plain", "Referer": f"{BASE}/auth/login", "Origin": BASE}
-    decrypt_resp(s.post(f"{BASE}/api/auth/login",
+    s.post(f"{BASE}/api/auth/login",
         data=encrypt_req(json.dumps({"username": DF_USER, "password": DF_PASS, "visitorId": None})),
-        headers=H, timeout=15).text)
-    r2 = decrypt_resp(s.post(f"{BASE}/api/auth/login-pin",
+        headers=H, timeout=15)
+    r2 = s.post(f"{BASE}/api/auth/login-pin",
         data=encrypt_req(json.dumps({"username": DF_USER, "password": DF_PASS, "pin": DF_PIN, "visitorId": None})),
-        headers=H, timeout=15).text)
-    if r2 and r2.get('success'):
+        headers=H, timeout=15)
+    d2 = decrypt_resp(r2.text)
+    if d2 and d2.get('success'):
         token = dict(s.cookies).get('accessToken', '')
-        print(f'[Login] API OK, token: {token[:20]}...')
-        return token
-    print('[Login] API falhou')
-    return None
+        print(f"[Login] OK, token: {token[:20]}...")
+        return s, token
+    print('[Login] Falhou')
+    return None, None
 
-# ── Playwright consulta ───────────────────────────────────────────────────────
-async def consultar(page, module_info, query_data):
-    url = f"{BASE}{module_info['url']}"
-    field = module_info['field']
-
-    # Sanitiza o query_data: remove formatação (pontos, traços, barras, espaços)
-    import re as _re
-    query_clean = _re.sub(r'[.\-/\s]', '', str(query_data).strip())
-    print(f'[Consulta] Query original: {query_data!r} -> limpo: {query_clean!r}')
-    query_data = query_clean
-
-    # Refresh cookie antes de cada consulta (token pode expirar no container)
+# ── Consulta via Server Action ────────────────────────────────────────────────
+def consultar(session, product_id, query_data):
+    module = MODULE_MAP.get(product_id) or MODULE_MAP.get('cpf-basico')
+    action_name = module['action']
+    action_id = SA_ACTIONS.get(action_name, SA_ACTIONS['cpf'])
+    
+    # Limpa query (remove pontos, traços, espaços)
+    query_clean = re.sub(r'[\.\-/\s]', '', str(query_data).strip())
+    
+    print(f"[Consulta] product={product_id} | action={action_name} | query={query_clean}")
+    
+    payload = json.dumps([query_clean]).encode()
+    headers = {
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Next-Action": action_id,
+        "Next-Router-State-Tree": '%5B%22%22%2C%7B%7D%2Cnull%2Cnull%2Ctrue%5D',
+        "Origin": BASE,
+        "Referer": f"{BASE}/app/modulos/investigador-osint",
+        "Accept": "text/x-component",
+    }
+    
     try:
-        new_token = api_login()
-        if new_token:
-            await page.context.add_cookies([{
-                'name': 'accessToken', 'value': new_token,
-                'domain': 'detetiveforense.com', 'path': '/', 'httpOnly': True, 'secure': True
-            }])
-            print(f'[Consulta] Cookie refreshed: {new_token[:20]}...')
+        r = session.post(
+            f"{BASE}/app/modulos/investigador-osint",
+            data=payload,
+            headers=headers,
+            timeout=40
+        )
+        print(f"[Consulta] HTTP {r.status_code}, size={len(r.text)}")
+        
+        # Extrai e descriptografa
+        b64_blocks = re.findall(r'\d+:T\d+,([A-Za-z0-9+/=]{100,})', r.text)
+        if not b64_blocks:
+            print("[Consulta] Sem blocos de dados na resposta")
+            return None
+        
+        data = decrypt_resp(b64_blocks[0])
+        if data is None:
+            print("[Consulta] Erro ao descriptografar")
+            return None
+        
+        print(f"[Consulta] Dados OK! Keys: {list(data.keys())[:5]}")
+        return data
+        
     except Exception as e:
-        print(f'[Consulta] Refresh erro: {e}')
+        print(f"[Consulta] Erro: {e}")
+        return None
 
-    # Navega para o módulo
-    await page.goto(url, wait_until='domcontentloaded', timeout=25000)
-    await page.wait_for_timeout(3000)
-    print(f'[Consulta] URL: {page.url}')
+# ── Formata resultado ──────────────────────────────────────────────────────────
+def formatar_resultado(data, product_id, query_data, product_name):
+    from datetime import datetime
+    agora = datetime.now().strftime("%d/%m/%Y às %H:%M")
+    
+    linhas = [
+        "🔍 RELATÓRIO — ACHAQUI",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📋 {product_name}",
+        f"🔎 Consulta: {query_data}",
+        f"📅 {agora}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
+    
+    cad = data.get('consulta', {}).get('cadastral', {})
+    
+    if cad:
+        linhas.append("👤 DADOS PESSOAIS")
+        if cad.get('nome'): linhas.append(f"  Nome: {cad['nome']}")
+        if cad.get('cpfMask'): linhas.append(f"  CPF: {cad['cpfMask']}")
+        if cad.get('dataNasc'): linhas.append(f"  Nascimento: {cad['dataNasc']} ({cad.get('idade','')} anos)")
+        if cad.get('naturalidade'): linhas.append(f"  Naturalidade: {cad['naturalidade']}")
+        if cad.get('sexo'): linhas.append(f"  Sexo: {'Masculino' if cad['sexo']=='M' else 'Feminino' if cad['sexo']=='F' else cad['sexo']}")
+        if cad.get('renda'): linhas.append(f"  Renda estimada: {cad['renda']}")
+        if cad.get('escolaridade'): linhas.append(f"  Escolaridade: {cad['escolaridade'].title()}")
+        if cad.get('indicativoCriminal'): linhas.append(f"  ⚠️ Indicativo criminal: SIM")
+        
+        mae = cad.get('mae', {})
+        pai = cad.get('pai', {})
+        if mae and mae.get('nome'):
+            linhas.append(f"  Mãe: {mae['nome']}")
+        if pai and pai.get('nome'):
+            linhas.append(f"  Pai: {pai['nome']}")
+        linhas.append("")
+    
+    consulta = data.get('consulta', {})
+    
+    # Endereços
+    enderecos = consulta.get('enderecos', [])
+    if enderecos:
+        linhas.append(f"📍 ENDEREÇOS ({len(enderecos)})")
+        for i, end in enumerate(enderecos[:3]):
+            parts = []
+            if end.get('logradouro'): parts.append(end['logradouro'])
+            if end.get('numero'): parts.append(end['numero'])
+            if end.get('bairro'): parts.append(end['bairro'])
+            if end.get('cidade'): parts.append(end['cidade'])
+            if end.get('uf'): parts.append(end['uf'])
+            if end.get('cep'): parts.append(f"CEP {end['cep']}")
+            if parts: linhas.append(f"  {i+1}. {', '.join(str(p) for p in parts if p)}")
+        linhas.append("")
+    
+    # Telefones
+    telefones = consulta.get('telefones', [])
+    if telefones:
+        linhas.append(f"📞 TELEFONES ({len(telefones)})")
+        for tel in telefones[:5]:
+            num = tel.get('numero') or tel.get('telefone') or str(tel)
+            op = tel.get('operadora', '')
+            linhas.append(f"  {num}" + (f" ({op})" if op else ""))
+        linhas.append("")
+    
+    # Emails
+    emails = consulta.get('emails', [])
+    if emails:
+        linhas.append(f"✉️ EMAILS ({len(emails)})")
+        for em in emails[:3]:
+            linhas.append(f"  {em.get('email', str(em))}")
+        linhas.append("")
+    
+    # Processos
+    processos = consulta.get('processos', [])
+    if processos:
+        linhas.append(f"⚖️ PROCESSOS ({len(processos)})")
+        for proc in processos[:3]:
+            classe = proc.get('classe', '')
+            assunto = proc.get('assunto', '')
+            tribunal = proc.get('tribunal', '')
+            linhas.append(f"  • {classe}" + (f" — {assunto}" if assunto else "") + (f" ({tribunal})" if tribunal else ""))
+        linhas.append("")
+    
+    # Parentes
+    parentes = consulta.get('parentes', [])
+    if parentes:
+        linhas.append(f"👨‍👩‍👧 PARENTES ({len(parentes)})")
+        for par in parentes[:4]:
+            nome = par.get('nome', '')
+            grau = par.get('grau', '')
+            if nome: linhas.append(f"  {nome}" + (f" ({grau})" if grau else ""))
+        linhas.append("")
+    
+    linhas.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    linhas.append("🔐 Achaqui — Consulta confidencial")
+    
+    return "\n".join(linhas)
 
-    # Se caiu na página de login, o cookie falhou
-    if '/auth/login' in page.url:
-        print('[Consulta] Redirecionado para login! Aguardando...')
-        await page.wait_for_timeout(3000)
+# ── Firestore helpers ─────────────────────────────────────────────────────────
+import urllib.request as _ur
 
-    # Preenche via page.type() - simula digitação real (funciona com React Hook Form)
+def fs_get(doc_path):
+    url = f"{FS_BASE}/{doc_path}?key={FK}"
     try:
-        await page.wait_for_timeout(2000)
-        cpf_input = None
-
-        # Tenta selectors em ordem de especificidade
-        for selector in [
-            f'input[name="{field}"]',
-            'input[inputmode="numeric"]',
-            'input[type="text"]:visible',
-            'input:visible',
-        ]:
-            try:
-                el = await page.wait_for_selector(selector, timeout=3000, state='visible')
-                if el:
-                    cpf_input = selector
-                    break
-            except:
-                continue
-
-        if cpf_input:
-            await page.click(cpf_input)
-            await page.fill(cpf_input, '')
-            await page.type(cpf_input, query_data, delay=50)
-            await page.wait_for_timeout(500)
-            # Enter para submit
-            await page.keyboard.press('Enter')
-            await page.wait_for_timeout(1000)
-            # Tenta também clicar no botão de busca
-            for btn_sel in ['button[type="submit"]', 'button:has-text("Pesquisar")', 'button:has-text("Buscar")']:
-                try:
-                    btn = await page.query_selector(btn_sel)
-                    if btn:
-                        await btn.click()
-                        break
-                except:
-                    pass
-            result = {'status': 'typed', 'selector': cpf_input, 'value': query_data}
-        else:
-            result = {'status': 'no_input_found'}
-
+        with _ur.urlopen(_ur.Request(url), timeout=10) as r:
+            return json.loads(r.read()).get('fields', {})
     except Exception as e:
-        result = {'status': 'error', 'msg': str(e)[:100]}
+        print(f"[FS] GET error: {e}")
+        return {}
 
-    print(f'[Consulta] Form submit: {result}')
-    # Debug: captura estado da página logo após o submit
+def fs_patch(doc_path, fields):
+    names = ','.join(fields.keys())
+    url = f"{FS_BASE}/{doc_path}?key={FK}&updateMask.fieldPaths={'&updateMask.fieldPaths='.join(fields.keys())}"
+    body = json.dumps({"fields": fields}).encode()
+    req = _ur.Request(url, data=body,
+        headers={"Content-Type": "application/json"}, method="PATCH")
     try:
-        print(f'[Debug] URL após submit: {page.url}')
-        title = await page.title()
-        print(f'[Debug] Title: {title}')
-        body_txt = await page.inner_text('body')
-        print(f'[Debug] Body (500c): {body_txt[:500]}')
-        # Conta inputs visíveis
-        n_inputs = await page.evaluate("() => document.querySelectorAll('input:not([type=hidden])').length")
-        print(f'[Debug] Inputs visíveis: {n_inputs}')
-    except Exception as de:
-        print(f'[Debug] erro: {de}')
-
-
-    # Aguarda resultado real (wait_for_selector robusto)
-    resultado_ok = False
-    try:
-        for rsel in ['text=Dados Pessoais', 'text=DADOS PESSOAIS', 'text=Nascimento', 'text=ENDEREÇOS', 'h2']:
-            try:
-                await page.wait_for_selector(rsel, timeout=6000, state='visible')
-                resultado_ok = True
-                print(f'[Consulta] Resultado detectado: {rsel}')
-                break
-            except:
-                continue
-    except:
-        pass
-    if not resultado_ok:
-        print('[Consulta] Sem resultado detectado, aguardando 15s...')
-        await page.wait_for_timeout(15000)
-
-    # Captura conteúdo
-    try:
-        content = await page.evaluate("""
-            () => {
-                const main = document.querySelector('main');
-                if (main && main.innerText && main.innerText.length > 200) return main.innerText;
-                for (const sel of ['[class*="result"]','[class*="card"]','[class*="dados"]','article']) {
-                    const el = document.querySelector(sel);
-                    if (el && el.innerText && el.innerText.length > 200) return el.innerText;
-                }
-                return document.body.innerText;
-            }
-        """)
-        print(f'[Consulta] Capturado ({len(content)} chars): {content[:500]}')
-        return content
+        with _ur.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
     except Exception as e:
-        body = await page.inner_text('body')
-        print(f'[Consulta] Fallback ({len(body)} chars): {body[:300]}')
-        return body
+        print(f"[FS] PATCH error: {e}")
+        return {}
 
-def formatar(raw, product_name, query_data):
-    now = datetime.now().strftime('%d/%m/%Y às %H:%M')
-    skip = ['Copiar', 'Exportar', 'Fechar', 'Buscar Mandados', 'Validar Foto',
-            'Galeria', '100% gratuito', 'caráter histórico', 'PRINCIPAL', 'Módulos']
-    linhas = [l.strip() for l in raw.split('\n') if l.strip() and not any(s in l for s in skip)]
-    out  = f'🔍 RELATÓRIO — ACHAQUI\n'
-    out += f'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
-    out += f'📋 {product_name}\n'
-    out += f'🔎 Consulta: {query_data}\n'
-    out += f'📅 {now}\n'
-    out += f'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
-    out += '\n'.join(linhas[:100])
-    return out
+def fs_query():
+    url = f"{FS_BASE}:runQuery?key={FK}"
+    body = json.dumps({"structuredQuery": {
+        "from": [{"collectionId": "orders"}],
+        "where": {"fieldFilter": {
+            "field": {"fieldPath": "status"},
+            "op": "EQUAL",
+            "value": {"stringValue": "processing"}
+        }},
+        "limit": 5
+    }}).encode()
+    req = _ur.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with _ur.urlopen(req, timeout=10) as r:
+            results = json.loads(r.read())
+            pedidos = []
+            for item in results:
+                doc = item.get('document')
+                if doc:
+                    fields = doc.get('fields', {})
+                    oid = doc['name'].split('/')[-1]
+                    pedidos.append({
+                        'id': oid,
+                        'productId':   fields.get('productId',{}).get('stringValue','cpf-basico'),
+                        'productName': fields.get('productName',{}).get('stringValue','Consulta'),
+                        'queryData':   fields.get('queryData',{}).get('stringValue',''),
+                        'userId':      fields.get('userId',{}).get('stringValue',''),
+                    })
+            return pedidos
+    except Exception as e:
+        print(f"[FS] Query error: {e}")
+        return []
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-async def main():
-    print('[Achaqui Worker] Iniciando...')
-    start = time.time()
-    processed = set()
+def ntfy_send(title, msg):
+    try:
+        req = _ur.Request(NTFY_URL,
+            data=msg.encode(),
+            headers={"Title": title, "Priority": "high", "Tags": "mag"},
+            method="POST")
+        _ur.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"[NTFY] {e}")
 
-    # Login via API
-    access_token = api_login()
-    if not access_token:
-        print('[Worker] Sem token, abortando')
+# ── Main loop ─────────────────────────────────────────────────────────────────
+def main():
+    print("[Achaqui Worker] Fix7 — Server Action direto (sem Playwright)")
+    
+    session, token = api_login()
+    if not session:
+        print("[Worker] Login falhou, abortando")
         return
+    
+    t0 = time.time()
+    last_fs = 0
+    pedidos_ok = 0
+    
+    while time.time() - t0 < RUN_SEC:
+        now = time.time()
+        
+        # Poll Firestore a cada 15s
+        if now - last_fs >= 15:
+            last_fs = now
+            pedidos = fs_query()
+            print(f"[Worker] {len(pedidos)} pedido(s) pendente(s)")
+            
+            for pedido in pedidos:
+                oid = pedido['id']
+                product_id = pedido['productId']
+                product_name = pedido['productName']
+                query_data = pedido['queryData']
+                
+                print(f"[Worker] Processando {oid} | {product_id} | {query_data}")
+                
+                # Marca como em processamento para evitar reprocessamento
+                from datetime import datetime, timezone
+                ts = datetime.now(timezone.utc).isoformat()
+                
+                # Faz a consulta
+                data = consultar(session, product_id, query_data)
+                
+                if data:
+                    resultado = formatar_resultado(data, product_id, query_data, product_name)
+                    status = 'done'
+                    print(f"[Worker] Consulta OK: {resultado[:100]}...")
+                else:
+                    # Tenta renegociar login e retentar uma vez
+                    print("[Worker] Consulta falhou, renovando sessão...")
+                    session, token = api_login()
+                    if session:
+                        data = consultar(session, product_id, query_data)
+                        if data:
+                            resultado = formatar_resultado(data, product_id, query_data, product_name)
+                            status = 'done'
+                        else:
+                            resultado = "❌ Erro ao consultar. Tente novamente."
+                            status = 'error'
+                    else:
+                        resultado = "❌ Erro de autenticação. Tente novamente."
+                        status = 'error'
+                
+                # Salva no Firestore
+                fields = {
+                    'status':      {'stringValue': status},
+                    'result':      {'stringValue': resultado},
+                    'deliveredAt': {'stringValue': ts},
+                }
+                fs_patch(f"orders/{oid}", fields)
+                print(f"[Worker] {oid} -> {status}")
+                
+                # Notifica
+                ntfy_send(f"Achaqui: {product_name}", f"{query_data}\n{status}")
+                pedidos_ok += 1
+                
+                time.sleep(2)
+        
+        time.sleep(5)
+    
+    print(f"[Worker] {RUN_SEC}s atingido. Processados: {pedidos_ok}")
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled']
-        )
-        context = await browser.new_context(
-            user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36',
-            viewport={'width': 1280, 'height': 800},
-            locale='pt-BR', timezone_id='America/Sao_Paulo'
-        )
-
-        if HAS_STEALTH:
-            await Stealth().apply_stealth_async(context)
-
-        # Injeta o accessToken
-        await context.add_cookies([{
-            'name': 'accessToken', 'value': access_token,
-            'domain': 'detetiveforense.com', 'path': '/', 'httpOnly': True, 'secure': True
-        }])
-
-        page = await context.new_page()
-
-        # Bloqueia o DevtoolDisabler
-        async def handle_route(route):
-            if DEVTOOL_CHUNK in route.request.url:
-                print(f'[Bypass] Bloqueado DevtoolDisabler')
-                await route.fulfill(status=200, content_type='application/javascript', body=FAKE_JS)
-            else:
-                await route.continue_()
-
-        await page.route('**/*', handle_route)
-
-        print('[Worker] Browser OK, entrando no loop...')
-
-        last_fs = 0
-        last_ntfy = 0
-
-        while True:
-            now = time.time()
-            if RUN_DURATION > 0 and (now - start) >= RUN_DURATION:
-                print(f'[Worker] {RUN_DURATION}s atingido. Encerrando.')
-                break
-
-            orders = []
-
-            if now - last_fs >= POLL_SEC:
-                last_fs = now
-                try:
-                    orders += fs_query()
-                except Exception as e:
-                    print(f'[Worker] Firestore erro: {e}')
-
-            if now - last_ntfy >= NTFY_SEC:
-                last_ntfy = now
-                try:
-                    for oid in ntfy_poll():
-                        if oid and oid not in processed:
-                            try:
-                                doc = fs_req(f'orders/{oid}')
-                                f = doc.get('fields', {})
-                                g = lambda k: (f.get(k) or {}).get('stringValue') or ''
-                                if g('status') == 'processing':
-                                    orders.append({'id': oid, 'productId': g('productId'), 'productName': g('productName'), 'queryData': g('queryData')})
-                            except: pass
-                except: pass
-
-            for order in orders:
-                oid = order['id']
-                if oid in processed: continue
-                processed.add(oid)
-
-                try:
-                    doc = fs_req(f'orders/{oid}')
-                    g = lambda k: (doc.get('fields', {}).get(k) or {}).get('stringValue') or ''
-                    if g('status') == 'done': continue
-                except: continue
-
-                print(f'[Worker] Processando {oid}: {order["productId"]} / {order["queryData"]}')
-
-                module_info = MODULE_MAP.get(order['productId'])
-                if not module_info:
-                    # Fallback: investigador-osint com o dado como CPF
-                    module_info = {'url': '/app/modulos/investigador-osint', 'field': 'cpf', 'tab': 'documentos'}
-
-                try:
-                    raw = await consultar(page, module_info, order['queryData'])
-                    resultado = formatar(raw, order.get('productName', order['productId']), order['queryData'])
-                    fs_save(oid, resultado)
-                    print(f'[Worker] ✅ {oid} ({len(resultado)} chars)')
-                except Exception as e:
-                    print(f'[Worker] ❌ {oid}: {e}')
-                    try: fs_error(oid, str(e))
-                    except: pass
-
-            await asyncio.sleep(NTFY_SEC)
-
-        await browser.close()
-
-asyncio.run(main())
+if __name__ == '__main__':
+    main()
