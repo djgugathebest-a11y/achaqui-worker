@@ -85,6 +85,9 @@ MODULE_MAP = {
     'historico-enderecos': {'action': 'cpf',        'field': 'cpf'},
     'telefones':           {'action': 'cpf',        'field': 'cpf'},
     'foto-redes':          {'action': 'cpf',        'field': 'cpf'},
+    'localizar-pessoa':    {'action': 'cpf',        'field': 'cpf'},
+    'localizar-celular':   {'action': 'cpf',        'field': 'cpf'},
+    'investigar-pessoa':   {'action': 'cpf',        'field': 'cpf'},
     'processos':           {'action': 'processos',  'field': 'cpf'},
     'cnpj-basico':         {'action': 'cnpj',       'field': 'cnpj'},
     'cnpj-completo':       {'action': 'cnpj',       'field': 'cnpj'},
@@ -151,12 +154,18 @@ def consultar(session, product_id, query_data):
         
         data = None
         for blk in b64_blocks:
-            data = decrypt_resp(blk)
-            if data is not None:
-                break
+            candidate = decrypt_resp(blk)
+            if candidate is not None and isinstance(candidate, dict):
+                # Valida que é dado real (não landing page ou erro genérico)
+                valid_keys = {'cpf', 'consulta', 'cnpj', 'documentos', 'processos', 'nomeend', 'success', 'data'}
+                if any(k in candidate for k in valid_keys):
+                    data = candidate
+                    break
+                else:
+                    print(f"[Consulta] Bloco descartado (keys inválidas): {list(candidate.keys())[:5]}")
         
         if data is None:
-            print("[Consulta] Erro ao descriptografar todos os blocos")
+            print("[Consulta] Nenhum bloco com dados válidos encontrado")
             return None
         
         print(f"[Consulta] Dados OK! Keys: {list(data.keys())[:5]}")
