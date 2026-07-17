@@ -141,13 +141,8 @@ def consultar(session, product_id, query_data):
         )
         print(f"[Consulta] HTTP {r.status_code}, size={len(r.text)}")
         
-        # Debug: loga raw quando resposta pequena ou sem blocos
-        if len(r.text) < 200000:
-            raw_preview = r.text[:3000].replace('\n', '\\n')
-            print(f"[Consulta][RAW] {raw_preview}")
-        
-        # Extrai e descriptografa — tenta blocos grandes primeiro, depois menores
-        b64_blocks = re.findall(r'\d+:T\d+,([A-Za-z0-9+/=]{20,})', r.text)
+        # Extrai e descriptografa — regex aceita tamanho em decimal OU hex (Next.js RSC)
+        b64_blocks = re.findall(r'\d+:T[0-9a-fA-F]+,([A-Za-z0-9+/=]{20,})', r.text)
         if not b64_blocks:
             print("[Consulta] Sem blocos de dados na resposta")
             return None
