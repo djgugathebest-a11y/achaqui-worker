@@ -141,15 +141,27 @@ def consultar(session, product_id, query_data):
         )
         print(f"[Consulta] HTTP {r.status_code}, size={len(r.text)}")
         
-        # Extrai e descriptografa
-        b64_blocks = re.findall(r'\d+:T\d+,([A-Za-z0-9+/=]{100,})', r.text)
+        # Debug: loga raw quando resposta pequena ou sem blocos
+        if len(r.text) < 200000:
+            raw_preview = r.text[:3000].replace('\n', '\\n')
+            print(f"[Consulta][RAW] {raw_preview}")
+        
+        # Extrai e descriptografa — tenta blocos grandes primeiro, depois menores
+        b64_blocks = re.findall(r'\d+:T\d+,([A-Za-z0-9+/=]{20,})', r.text)
         if not b64_blocks:
             print("[Consulta] Sem blocos de dados na resposta")
             return None
         
-        data = decrypt_resp(b64_blocks[0])
+        print(f"[Consulta] {len(b64_blocks)} bloco(s) encontrado(s), tamanhos: {[len(b) for b in b64_blocks[:5]]}")
+        
+        data = None
+        for blk in b64_blocks:
+            data = decrypt_resp(blk)
+            if data is not None:
+                break
+        
         if data is None:
-            print("[Consulta] Erro ao descriptografar")
+            print("[Consulta] Erro ao descriptografar todos os blocos")
             return None
         
         print(f"[Consulta] Dados OK! Keys: {list(data.keys())[:5]}")
