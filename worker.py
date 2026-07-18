@@ -344,7 +344,46 @@ def ntfy_send(title, msg):
     except Exception as e:
         print(f"[NTFY] {e}")
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+# ── Validação de dados de entrada ─────────────────────────────────────────────
+def validar_dado(product_id, query_data):
+    """Retorna (ok, motivo) — motivo só preenchido quando inválido."""
+    import re
+    q = re.sub(r'[\.\-/\s]', '', str(query_data).strip())
+    module = MODULE_MAP.get(product_id, {})
+    field = module.get('field', 'cpf')
+
+    if field == 'cpf':
+        if len(q) != 11 or not q.isdigit() or len(set(q)) == 1:
+            return False, f"CPF '{query_data}' inválido (deve ter 11 dígitos numéricos)."
+        # Dígitos verificadores
+        for i in range(9, 11):
+            soma = sum(int(q[j]) * ((i + 1) - j) for j in range(i))
+            dig = (soma * 10 % 11) % 10
+            if dig != int(q[i]):
+                return False, f"CPF '{query_data}' não existe na Receita Federal (dígito verificador inválido)."
+        return True, ""
+
+    elif field == 'cnpj':
+        if len(q) != 14 or not q.isdigit() or len(set(q)) == 1:
+            return False, f"CNPJ '{query_data}' inválido (deve ter 14 dígitos)."
+        return True, ""
+
+    elif field == 'placa':
+        if not re.match(r'^[A-Za-z]{3}\d[A-Za-z0-9]\d{2}$', q):
+            return False, f"Placa '{query_data}' inválida (formato esperado: ABC1234 ou ABC1D23)."
+        return True, ""
+
+    elif field == 'nome':
+        if len(query_data.strip()) < 3:
+            return False, f"Nome '{query_data}' muito curto."
+        return True, ""
+
+    # Outros campos — aceita qualquer coisa com ao menos 5 chars
+    if len(q) < 5:
+        return False, f"Dado '{query_data}' muito curto para consulta."
+    return True, ""
+
+
 def main():
     print("[Achaqui Worker] Fix7 — Server Action direto (sem Playwright)")
     
@@ -374,11 +413,31 @@ def main():
                 
                 print(f"[Worker] Processando {oid} | {product_id} | {query_data}")
                 
-                # Marca como em processamento para evitar reprocessamento
                 from datetime import datetime, timezone
                 ts = datetime.now(timezone.utc).isoformat()
-                
-                # Faz a consulta com retry ilimitado — renova sessão sempre que necessário
+
+                # Valida o dado antes de consultar
+                dado_ok, motivo = validar_dado(product_id, query_data)
+                if not dado_ok:
+                    print(f"[Worker] Dado inválido: {motivo}")
+                    resultado = (
+                        "⚠️ DADO INVÁLIDO\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"{motivo}\n\n"
+                        "Por favor, verifique o dado informado e entre em contato conosco "
+                        "para corrigir ou solicitar reembolso de saldo."
+                    )
+                    fields = {
+                        'status':      {'stringValue': 'invalid_data'},
+                        'result':      {'stringValue': resultado},
+                        'deliveredAt': {'stringValue': ts},
+                    }
+                    fs_patch(f"orders/{oid}", fields)
+                    print(f"[Worker] {oid} -> invalid_data")
+                    ntfy_send(f"Achaqui: dado inválido", f"{product_id} | {query_data}\n{motivo}")
+                    continue
+
+                # Faz a consulta com retry — renova sessão sempre que necessário
                 MAX_TENTATIVAS = 5
                 data = None
                 for tentativa in range(1, MAX_TENTATIVAS + 1):
