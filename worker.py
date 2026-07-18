@@ -156,9 +156,13 @@ def consultar(session, product_id, query_data):
         for blk in b64_blocks:
             candidate = decrypt_resp(blk)
             if candidate is not None and isinstance(candidate, dict):
-                # Valida que é dado real (não landing page ou erro genérico)
-                valid_keys = {'cpf', 'consulta', 'cnpj', 'documentos', 'processos', 'nomeend', 'success', 'data'}
+                # Valida que é dado real — chaves específicas dos módulos do Detetive Forense
+                valid_keys = {'cpf', 'consulta', 'cnpj', 'documentos', 'processos', 'nomeend'}
                 if any(k in candidate for k in valid_keys):
+                    data = candidate
+                    break
+                # Também aceita se tem 'success': True (login ok) + alguma chave de dados
+                if candidate.get('success') is True and len(candidate) > 2:
                     data = candidate
                     break
                 else:
@@ -374,36 +378,40 @@ def main():
                 from datetime import datetime, timezone
                 ts = datetime.now(timezone.utc).isoformat()
                 
-                # Faz a consulta
-                data = consultar(session, product_id, query_data)
-                
+                # Faz a consulta com retry ilimitado — renova sessão sempre que necessário
+                MAX_TENTATIVAS = 5
+                data = None
+                for tentativa in range(1, MAX_TENTATIVAS + 1):
+                    data = consultar(session, product_id, query_data)
+                    if data:
+                        break
+                    print(f"[Worker] Tentativa {tentativa}/{MAX_TENTATIVAS} falhou — renovando sessão...")
+                    session, token = api_login()
+                    if not session:
+                        print("[Worker] Login falhou, aguardando 10s...")
+                        time.sleep(10)
+                        session, token = api_login()  # segunda chance
+                    time.sleep(3)
+
                 if data:
                     resultado = formatar_resultado(data, product_id, query_data, product_name)
                     status = 'done'
-                    print(f"[Worker] Consulta OK: {resultado[:100]}...")
+                    print(f"[Worker] Consulta OK (tentativa {tentativa}): {resultado[:80]}...")
                 else:
-                    # Tenta renegociar login e retentar uma vez
-                    print("[Worker] Consulta falhou, renovando sessão...")
-                    session, token = api_login()
-                    if session:
-                        data = consultar(session, product_id, query_data)
-                        if data:
-                            resultado = formatar_resultado(data, product_id, query_data, product_name)
-                            status = 'done'
-                        else:
-                            resultado = "❌ Erro ao consultar. Tente novamente."
-                            status = 'error'
-                    else:
-                        resultado = "❌ Erro de autenticação. Tente novamente."
-                        status = 'error'
+                    # Todas as tentativas falharam — mantém processing para próximo run
+                    print(f"[Worker] {oid} falhou após {MAX_TENTATIVAS} tentativas — mantendo processing")
+                    resultado = ""
+                    status = 'processing'
                 
-                # Salva no Firestore
-                fields = {
-                    'status':      {'stringValue': status},
-                    'result':      {'stringValue': resultado},
-                    'deliveredAt': {'stringValue': ts},
-                }
-                fs_patch(f"orders/{oid}", fields)
+                # Salva no Firestore (se processing, não sobrescreve resultado)
+                if status == 'done':
+                    fields = {
+                        'status':      {'stringValue': status},
+                        'result':      {'stringValue': resultado},
+                        'deliveredAt': {'stringValue': ts},
+                    }
+                    fs_patch(f"orders/{oid}", fields)
+                # Se processing, não faz nada — o próximo run vai tentar de novo
                 print(f"[Worker] {oid} -> {status}")
                 
                 # Notifica
