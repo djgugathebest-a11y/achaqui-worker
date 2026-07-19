@@ -144,6 +144,12 @@ def consultar(session, product_id, query_data):
         )
         print(f"[Consulta] HTTP {r.status_code}, size={len(r.text)}")
         
+        # Verificação rápida: se a resposta contém marcadores da landing page, sessão expirou
+        LANDING_MARKERS = ['investigadores profissionais', 'Acesse sua conta para continuar', 'word word word']
+        if any(m in r.text for m in LANDING_MARKERS):
+            print("[Consulta] Resposta é landing page — sessão expirada")
+            return None
+        
         # Extrai e descriptografa — regex aceita tamanho em decimal OU hex (Next.js RSC)
         b64_blocks = re.findall(r'\d+:T[0-9a-fA-F]+,([A-Za-z0-9+/=]{20,})', r.text)
         if not b64_blocks:
