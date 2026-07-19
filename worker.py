@@ -454,8 +454,20 @@ def main():
 
                 if data:
                     resultado = formatar_resultado(data, product_id, query_data, product_name)
-                    status = 'done'
-                    print(f"[Worker] Consulta OK (tentativa {tentativa}): {resultado[:80]}...")
+                    # Verificação final: resultado real tem pelo menos Nome ou Endereço
+                    # Se contiver texto da landing page → rejeitar
+                    landing_markers = ['A melhor plataforma exclusiva', 'investigadores profissionais', 'word word word', 'mmMwWLliI0']
+                    resultado_invalido = any(m in resultado for m in landing_markers)
+                    # Resultado útil deve ter ao menos uma linha de dado (nome, CPF, endereço)
+                    tem_dado = any(x in resultado for x in ['Nome:', 'CPF:', 'Endereço', 'TELEFONE', 'ENDEREÇO', 'Nascimento:', 'Titular:', 'Proprietário:'])
+                    
+                    if resultado_invalido or not tem_dado:
+                        print(f"[Worker] Resultado rejeitado (landing page ou sem dados). Tentando novamente...")
+                        data = None  # força retry
+                        status = 'processing'
+                    else:
+                        status = 'done'
+                        print(f"[Worker] Consulta OK (tentativa {tentativa}): {resultado[:80]}...")
                 else:
                     # Todas as tentativas falharam — mantém processing para próximo run
                     print(f"[Worker] {oid} falhou após {MAX_TENTATIVAS} tentativas — mantendo processing")
